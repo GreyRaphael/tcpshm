@@ -11,6 +11,7 @@ Additionally, both sides of a connection have a specified name, and a pair of su
 This is a framework in that it provides a server side and client side C++ template class, which implement a typical tcp server and client and are also highly configurable and customizable. For server, the framework supports connection sharding: user predefines a set of connection groups, having one or more threads polling these groups, and once there's a new connection user can decide which group to assign to, so the framework gives the user full control over the mapping between serving threads and client connections.
 
 ## Technical Features
+  * windows & linux support
   * No source files, only header files, so no library to build and link
   * No external library dependencies
   * Non-blocking(except client Connect())
