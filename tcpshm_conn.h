@@ -25,7 +25,7 @@ SOFTWARE.
 #pragma once
 #include "ptcp_conn.h"
 #include "spsc_varq.h"
-#include "mmap.h"
+#include "os.h"
 
 namespace tcpshm {
 

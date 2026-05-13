@@ -25,8 +25,8 @@ SOFTWARE.
 #pragma once
 #include "ptcp_queue.h"
 #include "mmap.h"
+#include "os.h"
 #include <memory>
-#include <sys/uio.h>
 
 namespace tcpshm {
 
@@ -118,8 +118,8 @@ public:
         }
     }
 
-    // precondition: sockfd_ == fd_to_close_ == -1
-    void Open(int sock_fd, uint32_t remote_ack_seq, int64_t now) {
+    // precondition: sockfd_ == fd_to_close_ == -1 (or INVALID_TCP_SOCKET)
+    void Open(tcp_socket_t sock_fd, uint32_t remote_ack_seq, int64_t now) {
         sockfd_ = fd_to_close_ = sock_fd;
         writeidx_ = readidx_ = nextmsg_idx_ = 0;
         recv_time_ = send_time_ = now_ = now;
@@ -207,10 +207,10 @@ public:
             if(SendPending()) return;
             hbmsg_.ack_seq = Endian<Conf::ToLittleEndian>::Convert(q_->MyAck());
         }
-        int sent = ::send(sockfd_, &hbmsg_, sizeof(hbmsg_), MSG_NOSIGNAL);
-        if(sent < 0 && errno == EAGAIN) return;
-        if(sent != sizeof(MsgHeader)) { // for simplicity, we see partial sendout as error
-            Close("Send error", sent < 0 ? errno : 0);
+        int sent = tcp_send(sockfd_, (const char*)&hbmsg_, sizeof(hbmsg_), TCP_MSG_NOSIGNAL);
+        if(sent < 0 && tcp_get_last_error() == TCP_ERR_AGAIN) return;
+        if(sent != (int)sizeof(MsgHeader)) { // for simplicity, we see partial sendout as error
+            Close("Send error", sent < 0 ? tcp_get_last_error() : 0);
             return;
         }
         send_time_ = now_; // successfully sent
@@ -224,10 +224,11 @@ public:
         if(blk_sz == 0) return false;
         uint32_t size = blk_sz << 3;
         do {
-            int sent = ::send(sockfd_, p, size, MSG_NOSIGNAL);
+            int sent = tcp_send(sockfd_, p, size, TCP_MSG_NOSIGNAL);
             if(sent < 0) {
-                if(errno != EAGAIN || (size & 7)) {
-                    Close("Send error", errno);
+                int err = tcp_get_last_error();
+                if(err != TCP_ERR_AGAIN || (size & 7)) {
+                    Close("Send error", err);
                     return false;
                 }
                 else
@@ -245,14 +246,14 @@ public:
     }
 
     bool IsClosed() {
-        return sockfd_ < 0;
+        return sockfd_ == INVALID_TCP_SOCKET;
     }
 
     // not thread safe
     bool TryCloseFd() {
-        if(sockfd_ < 0 && fd_to_close_ >= 0) {
-            ::close(fd_to_close_);
-            fd_to_close_ = -1;
+        if(sockfd_ == INVALID_TCP_SOCKET && fd_to_close_ != INVALID_TCP_SOCKET) {
+            tcp_close(fd_to_close_);
+            fd_to_close_ = INVALID_TCP_SOCKET;
             return true;
         }
         return false;
@@ -275,12 +276,13 @@ private:
     // thread safe
     // need to call TryCloseFd to really close it
     void Close(const char* reason, int sys_errno) {
-        if(sockfd_ < 0) return;
-        sockfd_ = -1;
+        if(sockfd_ == INVALID_TCP_SOCKET) return;
+        sockfd_ = INVALID_TCP_SOCKET;
         close_reason_ = reason;
         close_errno_ = sys_errno;
     }
 
+    // For Windows: emulate readv scatter-gather by using two recv calls
     int DoRecv() {
         char stackbuf[65536];
         if(readidx_ > 0 && readidx_ == writeidx_) {
@@ -294,6 +296,21 @@ private:
                                        readidx_ + (allow_expand ? Conf::TcpRecvBufMaxSize - recvbuf_size_ : 0));
         if(writable + extra_size == 0) return 0;
         int ret;
+#ifdef _WIN32
+        // Windows: emulate readv with two recv calls
+        if(extra_size == 0) {
+            ret = tcp_recv(sockfd_, &recvbuf_[writeidx_], writable, 0);
+        }
+        else {
+            // First recv into buffer
+            ret = tcp_recv(sockfd_, &recvbuf_[writeidx_], writable, 0);
+            // Try to read extra into stackbuf
+            if(ret > 0 && (uint32_t)ret == writable) {
+                int ret2 = tcp_recv(sockfd_, stackbuf, extra_size, 0);
+                if(ret2 > 0) ret += ret2;
+            }
+        }
+#else
         if(extra_size == 0){
             ret = ::read(sockfd_, &recvbuf_[writeidx_], writable);
         }
@@ -305,15 +322,17 @@ private:
             vec[1].iov_len = extra_size;
             ret = ::readv(sockfd_, vec, 2);
         }
+#endif
         if(ret <= 0) {
             if(ret < 0) {
-                if(errno == EAGAIN) {
+                int err = tcp_get_last_error();
+                if(err == TCP_ERR_AGAIN) {
                     if(now_ - recv_time_ > Conf::ConnectionTimeout) {
                         Close("Timeout", 0);
                     }
                 }
                 else {
-                    Close("Read error", errno);
+                    Close("Read error", err);
                 }
             }
             else { // ret == 0;
@@ -322,8 +341,8 @@ private:
             return 0;
         }
         recv_time_ = now_;
-        if(ret <= writable) return ret;
-        if(ret <= writable + readidx_) { // need to memmove
+        if(ret <= (int)writable) return ret;
+        if(ret <= (int)(writable + readidx_)) { // need to memmove
             memmove(&recvbuf_[0], &recvbuf_[readidx_], recvbuf_size_ - readidx_);
             memcpy(&recvbuf_[recvbuf_size_ - readidx_], stackbuf, ret - writable);
         }
@@ -349,8 +368,8 @@ private:
 private:
     using PTCPQ = PTCPQueue<Conf::TcpQueueSize, Conf::ToLittleEndian>;
     PTCPQ* q_ = nullptr; // may be mmaped to file
-    int sockfd_ = -1;
-    int fd_to_close_ = -1;
+    tcp_socket_t sockfd_ = INVALID_TCP_SOCKET;
+    tcp_socket_t fd_to_close_ = INVALID_TCP_SOCKET;
     const char* close_reason_ = "nil";
     int close_errno_ = 0;
     static_assert(Conf::TcpRecvBufMaxSize >= Conf::TcpRecvBufInitSize, "Conf::TcpRecvBufMaxSize too small");

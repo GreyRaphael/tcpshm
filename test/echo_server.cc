@@ -1,5 +1,12 @@
 #include "../tcpshm_server.h"
-#include <bits/stdc++.h>
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <string>
+#include <cstring>
+#include <csignal>
+#include <cstdlib>
+#include <functional>
 #include "timestamp.h"
 #include "common.h"
 #include "cpupin.h"

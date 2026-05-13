@@ -1,5 +1,15 @@
+#ifdef _WIN32
+#include <windows.h>
+bool cpupin(int cpuid) {
+    DWORD_PTR mask = 1ULL << cpuid;
+    if(SetThreadAffinityMask(GetCurrentThread(), mask) == 0) {
+        std::cout << "SetThreadAffinityMask error" << std::endl;
+        return false;
+    }
+    return true;
+}
+#else
 #include <sched.h>
-
 bool cpupin(int cpuid) {
     cpu_set_t my_set;
     CPU_ZERO(&my_set);
@@ -8,6 +18,6 @@ bool cpupin(int cpuid) {
         std::cout << "sched_setaffinity error: " << strerror(errno) << std::endl;
         return false;
     }
-
     return true;
 }
+#endif

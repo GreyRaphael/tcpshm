@@ -24,6 +24,7 @@ SOFTWARE.
 
 #pragma once
 #include "msg_header.h"
+#include "os.h"
 
 namespace tcpshm {
 
@@ -42,15 +43,14 @@ public:
     // min_read_idx could be a negtive value which results in a large unsigned int
     uint32_t min_read_idx = write_idx + blk_sz + (rewind ? padding_sz : 0) - BLK_CNT;
     if ((int)(read_idx_cach - min_read_idx) < 0) {
-      asm volatile("" : "=m"(read_idx) : :); // force read memory
-      read_idx_cach = read_idx;
+      read_idx_cach = tcp_volatile_read(read_idx);
       if ((int)(read_idx_cach - min_read_idx) < 0) { // no enough space
         return nullptr;
       }
     }
     if (rewind) {
       blk[write_idx % BLK_CNT].header.size = 0;
-      asm volatile("" : : "m"(blk), "m"(write_idx) :); // memory fence
+      tcp_compiler_barrier();
       write_idx += padding_sz;
     }
     MsgHeader& header = blk[write_idx % BLK_CNT].header;
@@ -59,14 +59,15 @@ public:
     }
 
     void Push() {
-        asm volatile("" : : "m"(blk), "m"(write_idx) :); // memory fence
+        tcp_compiler_barrier();
         uint32_t blk_sz = (blk[write_idx % BLK_CNT].header.size + sizeof(Block) - 1) / sizeof(Block);
         write_idx += blk_sz;
-        asm volatile("" : : "m"(write_idx) : ); // force write memory
+        tcp_volatile_write(write_idx, write_idx);
     }
 
     MsgHeader* Front() {
-        asm volatile("" : "=m"(write_idx), "=m"(blk) : :); // force read memory
+        tcp_volatile_read(write_idx);
+        tcp_compiler_barrier();
         if(read_idx == write_idx) {
             return nullptr;
         }
@@ -81,10 +82,11 @@ public:
     }
 
     void Pop() {
-        asm volatile("" : "=m"(blk) : "m"(read_idx) :); // memory fence
+        tcp_compiler_barrier();
+        tcp_volatile_read(read_idx);
         uint32_t blk_sz = (blk[read_idx % BLK_CNT].header.size + sizeof(Block) - 1) / sizeof(Block);
         read_idx += blk_sz;
-        asm volatile("" : : "m"(read_idx) : ); // force write memory
+        tcp_volatile_write(read_idx, read_idx);
     }
 
 private:

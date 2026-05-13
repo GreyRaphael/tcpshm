@@ -25,11 +25,7 @@ SOFTWARE.
 #pragma once
 #include <string>
 #include <array>
-#include <strings.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
+#include "os.h"
 #include "tcpshm_conn.h"
 
 namespace tcpshm {
@@ -46,7 +42,7 @@ protected:
     TcpShmClient(const std::string& client_name, const std::string& ptcp_dir)
         : ptcp_dir_(ptcp_dir) {
         strncpy(client_name_, client_name.c_str(), sizeof(client_name_) - 1);
-        mkdir(ptcp_dir_.c_str(), 0755);
+        tcp_mkdir(ptcp_dir_.c_str());
         client_name_[sizeof(client_name_) - 1] = 0;
         conn_.init(ptcp_dir.c_str(), client_name_);
     }
@@ -71,7 +67,7 @@ protected:
             std::string last_server_name_file = std::string(ptcp_dir_) + "/" + client_name_ + ".lastserver";
             server_name_ = (char*)my_mmap<ServerName>(last_server_name_file.c_str(), false, &error_msg);
             if(!server_name_) {
-                static_cast<Derived*>(this)->OnSystemError(error_msg, errno);
+                static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
                 return false;
             }
             strncpy(conn_.GetRemoteName(), server_name_, sizeof(ServerName));
@@ -89,62 +85,62 @@ protected:
         if(server_name_[0] &&
            (!conn_.OpenFile(use_shm, &error_msg) ||
             !conn_.GetSeq(&sendbuf[0].ack_seq, &login->client_seq_start, &login->client_seq_end, &error_msg))) {
-            static_cast<Derived*>(this)->OnSystemError(error_msg, errno);
+            static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
             return false;
         }
-        int fd;
-        if((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("socket", errno);
+        tcp_socket_t fd;
+        if((fd = tcp_socket(AF_INET, SOCK_STREAM, 0)) == INVALID_TCP_SOCKET) {
+            static_cast<Derived*>(this)->OnSystemError("socket", tcp_get_last_error());
             return false;
         }
         struct timeval timeout;
         timeout.tv_sec = 10;
         timeout.tv_usec = 0;
 
-        if(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_RCVTIMEO", errno);
-            close(fd);
+        if(tcp_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_RCVTIMEO", tcp_get_last_error());
+            tcp_close(fd);
             return false;
         }
 
-        if(setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_RCVTIMEO", errno);
-            close(fd);
+        if(tcp_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_SNDTIMEO", tcp_get_last_error());
+            tcp_close(fd);
             return false;
         }
         int yes = 1;
-        if(Conf::TcpNoDelay && setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt TCP_NODELAY", errno);
-            close(fd);
+        if(Conf::TcpNoDelay && tcp_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&yes, sizeof(yes)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("setsockopt TCP_NODELAY", tcp_get_last_error());
+            tcp_close(fd);
             return false;
         }
 
         struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
         inet_pton(AF_INET, server_ipv4, &(server_addr.sin_addr));
         server_addr.sin_port = htons(server_port);
-        bzero(&(server_addr.sin_zero), 8);
 
-        if(connect(fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("connect", errno);
-            close(fd);
+        if(tcp_connect(fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("connect", tcp_get_last_error());
+            tcp_close(fd);
             return false;
         }
 
         sendbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
         login->ConvertByteOrder();
-        int ret = send(fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
-        if(ret != sizeof(sendbuf)) {
-            static_cast<Derived*>(this)->OnSystemError("send", ret < 0 ? errno : 0);
-            close(fd);
+        int ret = tcp_send(fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+        if(ret != (int)sizeof(sendbuf)) {
+            static_cast<Derived*>(this)->OnSystemError("send", ret < 0 ? tcp_get_last_error() : 0);
+            tcp_close(fd);
             return false;
         }
 
         MsgHeader recvbuf[1 + (sizeof(LoginRspMsg) + 7) / 8];
-        ret = recv(fd, recvbuf, sizeof(recvbuf), 0);
-        if(ret != sizeof(recvbuf)) {
-            static_cast<Derived*>(this)->OnSystemError("recv", ret < 0 ? errno : 0);
-            close(fd);
+        ret = tcp_recv(fd, (char*)recvbuf, sizeof(recvbuf), 0);
+        if(ret != (int)sizeof(recvbuf)) {
+            static_cast<Derived*>(this)->OnSystemError("recv", ret < 0 ? tcp_get_last_error() : 0);
+            tcp_close(fd);
             return false;
         }
         LoginRspMsg* login_rsp = (LoginRspMsg*)(recvbuf + 1);
@@ -153,7 +149,7 @@ protected:
         if(recvbuf[0].size != sizeof(MsgHeader) + sizeof(LoginRspMsg) || recvbuf[0].msg_type != LoginRspMsg::msg_type ||
            login_rsp->server_name[0] == 0) {
             static_cast<Derived*>(this)->OnSystemError("Invalid LoginRsp", 0);
-            close(fd);
+            tcp_close(fd);
             return false;
         }
         if(login_rsp->status != 0) {
@@ -170,7 +166,7 @@ protected:
             else {
                 static_cast<Derived*>(this)->OnLoginReject(login_rsp);
             }
-            close(fd);
+            tcp_close(fd);
             return false;
         }
         login_rsp->server_name[sizeof(login_rsp->server_name) - 1] = 0;
@@ -180,13 +176,13 @@ protected:
             strncpy(server_name_, login_rsp->server_name, sizeof(ServerName));
             strncpy(conn_.GetRemoteName(), server_name_, sizeof(ServerName));
             if(!conn_.OpenFile(use_shm, &error_msg)) {
-                static_cast<Derived*>(this)->OnSystemError(error_msg, errno);
-                close(fd);
+                static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
+                tcp_close(fd);
                 return false;
             }
             conn_.Reset();
         }
-        fcntl(fd, F_SETFL, O_NONBLOCK);
+        tcp_set_nonblocking(fd);
         int64_t now = static_cast<Derived*>(this)->OnLoginSuccess(login_rsp);
 
         conn_.Open(fd, recvbuf[0].ack_seq, now);

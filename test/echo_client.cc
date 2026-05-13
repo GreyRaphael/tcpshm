@@ -1,5 +1,11 @@
 #include "../tcpshm_client.h"
-#include <bits/stdc++.h>
+#include <iostream>
+#include <thread>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <cassert>
+#include <ctime>
 #include "timestamp.h"
 #include "common.h"
 #include "cpupin.h"
@@ -45,7 +51,7 @@ public:
         send_num = my_mmap<int>(send_num_file.c_str(), false, &error_msg);
         recv_num = my_mmap<int>(recv_num_file.c_str(), false, &error_msg);
         if(!send_num || !recv_num) {
-            cout << "System Error: " << error_msg << " syserrno: " << strerror(errno) << endl;
+            cout << "System Error: " << error_msg << " syserrno: " << strerror(tcp_get_last_error()) << endl;
             return;
         }
         cout << "client started, send_num: " << *send_num << " recv_num: " << *recv_num << endl;

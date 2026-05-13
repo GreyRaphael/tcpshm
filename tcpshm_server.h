@@ -24,11 +24,7 @@ SOFTWARE.
 
 #pragma once
 #include <string>
-#include <strings.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
+#include "os.h"
 #include "tcpshm_conn.h"
 
 namespace tcpshm {
@@ -46,7 +42,7 @@ protected:
         : ptcp_dir_(ptcp_dir) {
         strncpy(server_name_, server_name.c_str(), sizeof(server_name_) - 1);
         server_name_[sizeof(server_name_) - 1] = 0;
-        mkdir(ptcp_dir_.c_str(), 0755);
+        tcp_mkdir(ptcp_dir_.c_str());
         for(auto& conn : conn_pool_) {
             conn.init(ptcp_dir.c_str(), server_name_);
         }
@@ -70,38 +66,38 @@ protected:
     // start the server
     // return true if success
     bool Start(const char* listen_ipv4, uint16_t listen_port) {
-        if(listenfd_ >= 0) {
+        if(listenfd_ != INVALID_TCP_SOCKET) {
             static_cast<Derived*>(this)->OnSystemError("already started", 0);
             return false;
         }
 
-        if((listenfd_ = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("socket", errno);
+        if((listenfd_ = tcp_socket(AF_INET, SOCK_STREAM, 0)) == INVALID_TCP_SOCKET) {
+            static_cast<Derived*>(this)->OnSystemError("socket", tcp_get_last_error());
             return false;
         }
 
-        fcntl(listenfd_, F_SETFL, O_NONBLOCK);
+        tcp_set_nonblocking(listenfd_);
         int yes = 1;
-        if(setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_REUSEADDR", errno);
+        if(tcp_setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_REUSEADDR", tcp_get_last_error());
             return false;
         }
-        if(Conf::TcpNoDelay && setsockopt(listenfd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt TCP_NODELAY", errno);
+        if(Conf::TcpNoDelay && tcp_setsockopt(listenfd_, IPPROTO_TCP, TCP_NODELAY, (const char*)&yes, sizeof(yes)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("setsockopt TCP_NODELAY", tcp_get_last_error());
             return false;
         }
 
         struct sockaddr_in local_addr;
+        memset(&local_addr, 0, sizeof(local_addr));
         local_addr.sin_family = AF_INET;
         inet_pton(AF_INET, listen_ipv4, &(local_addr.sin_addr));
         local_addr.sin_port = htons(listen_port);
-        bzero(&(local_addr.sin_zero), 8);
-        if(bind(listenfd_, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("bind", errno);
+        if(tcp_bind(listenfd_, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("bind", tcp_get_last_error());
             return false;
         }
-        if(listen(listenfd_, 5) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("listen", errno);
+        if(tcp_listen(listenfd_, 5) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("listen", tcp_get_last_error());
             return false;
         }
         return true;
@@ -113,10 +109,10 @@ protected:
         if(avail_idx_ != Conf::MaxNewConnections) {
             NewConn& conn = new_conns_[avail_idx_];
             socklen_t addr_len = sizeof(conn.addr);
-            conn.fd = accept(listenfd_, (struct sockaddr*)&(conn.addr), &addr_len);
+            conn.fd = tcp_accept(listenfd_, (struct sockaddr*)&(conn.addr), &addr_len);
             // we ignore errors from accept as most errno should be treated like EAGAIN
-            if(conn.fd >= 0) {
-                fcntl(conn.fd, F_SETFL, O_NONBLOCK);
+            if(conn.fd != INVALID_TCP_SOCKET) {
+                tcp_set_nonblocking(conn.fd);
                 conn.time = now;
                 avail_idx_ = Conf::MaxNewConnections;
             }
@@ -124,15 +120,15 @@ protected:
         // visit all new connections, trying to read LoginMsg
         for(int i = 0; i < Conf::MaxNewConnections; i++) {
             NewConn& conn = new_conns_[i];
-            if(conn.fd < 0) {
+            if(conn.fd == INVALID_TCP_SOCKET) {
                 avail_idx_ = i;
                 continue;
             }
-            int ret = ::recv(conn.fd, conn.recvbuf, sizeof(conn.recvbuf), 0);
-            if(ret < 0 && errno == EAGAIN && now - conn.time <= Conf::NewConnectionTimeout) {
+            int ret = tcp_recv(conn.fd, (char*)conn.recvbuf, sizeof(conn.recvbuf), 0);
+            if(ret < 0 && tcp_get_last_error() == TCP_ERR_AGAIN && now - conn.time <= Conf::NewConnectionTimeout) {
                 continue;
             }
-            if(ret == sizeof(conn.recvbuf)) {
+            if(ret == (int)sizeof(conn.recvbuf)) {
                 conn.recvbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
                 if(conn.recvbuf[0].size == sizeof(MsgHeader) + sizeof(LoginMsg) &&
                    conn.recvbuf[0].msg_type == LoginMsg::msg_type) {
@@ -148,9 +144,9 @@ protected:
                 }
             }
 
-            if(conn.fd >= 0) {
-                ::close(conn.fd);
-                conn.fd = -1;
+            if(conn.fd != INVALID_TCP_SOCKET) {
+                tcp_close(conn.fd);
+                conn.fd = INVALID_TCP_SOCKET;
             }
             avail_idx_ = i;
         }
@@ -191,7 +187,7 @@ protected:
     void PollTcp(int64_t now, int grpid) {
         auto& grp = tcp_grps_[grpid];
         // force read grp.live_cnt from memory, it could have been changed by Ctl thread
-        asm volatile("" : "=m"(grp.live_cnt) : :);
+        tcp_volatile_read(grp.live_cnt);
         for(int i = 0; i < grp.live_cnt; i++) {
             // it's possible that grp.conns is being swapped by Ctl thread
             // so some live conn could be missed, some closed one could be visited
@@ -205,7 +201,7 @@ protected:
     // poll shm for serving shm connections
     void PollShm(int grpid) {
         auto& grp = shm_grps_[grpid];
-        asm volatile("" : "=m"(grp.live_cnt) : :);
+        tcp_volatile_read(grp.live_cnt);
         for(int i = 0; i < grp.live_cnt; i++) {
             Connection& conn = *grp.conns[i];
             MsgHeader* head = conn.ShmFront();
@@ -214,16 +210,16 @@ protected:
     }
 
     void Stop() {
-        if(listenfd_ < 0) {
+        if(listenfd_ == INVALID_TCP_SOCKET) {
             return;
         }
-        ::close(listenfd_);
-        listenfd_ = -1;
+        tcp_close(listenfd_);
+        listenfd_ = INVALID_TCP_SOCKET;
         for(int i = 0; i < Conf::MaxNewConnections; i++) {
-            int& fd = new_conns_[i].fd;
-            if(fd >= 0) {
-                ::close(fd);
-                fd = -1;
+            tcp_socket_t& fd = new_conns_[i].fd;
+            if(fd != INVALID_TCP_SOCKET) {
+                tcp_close(fd);
+                fd = INVALID_TCP_SOCKET;
             }
         }
         avail_idx_ = 0;
@@ -245,7 +241,7 @@ private:
     struct NewConn
     {
         int64_t time;
-        int fd = -1;
+        tcp_socket_t fd = INVALID_TCP_SOCKET;
         struct sockaddr_in addr;
         MsgHeader recvbuf[1 + (sizeof(LoginMsg) + 7) / 8];
     };
@@ -270,7 +266,7 @@ private:
         LoginMsg* login = (LoginMsg*)(conn.recvbuf + 1);
         if(login->client_name[0] == 0) {
             strncpy(login_rsp->error_msg, "Invalid client name", sizeof(login_rsp->error_msg));
-            ::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
+            tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
             return;
         }
         login->client_name[sizeof(login->client_name) - 1] = 0;
@@ -279,7 +275,7 @@ private:
             if(login_rsp->error_msg[0] == 0) { // user didn't set error_msg? set a default one
                 strncpy(login_rsp->error_msg, "Login Reject", sizeof(login_rsp->error_msg));
             }
-            ::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
+            tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
             return;
         }
         auto& grp = grps[grpid];
@@ -296,16 +292,16 @@ private:
             // match
             if(i < grp.live_cnt) {
                 strncpy(login_rsp->error_msg, "Already loggned on", sizeof(login_rsp->error_msg));
-                ::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
+                tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
                 return;
             }
 
             const char* error_msg;
             if(!curconn.OpenFile(login->use_shm, &error_msg)) {
                 // we can not mmap to ptcp or chm files with filenames related to local and remote name
-                static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, errno);
+                static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
                 strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg));
-                ::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
+                tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
                 return;
             }
             uint32_t local_ack_seq = 0;
@@ -321,9 +317,9 @@ private:
             }
             else {
                 if(!curconn.GetSeq(&local_ack_seq, &local_seq_start, &local_seq_end, &error_msg)) {
-                    static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, errno);
+                    static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
                     strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg));
-                    ::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
+                    tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
                     return;
                 }
             }
@@ -341,17 +337,17 @@ private:
                                                                  remote_seq_start,
                                                                  remote_seq_end);
                 login_rsp->status = 1;
-                ::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
+                tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
                 return;
             }
 
             // send Login OK
             login_rsp->status = 0;
-            if(::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL) != sizeof(sendbuf)) {
+            if(tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL) != (int)sizeof(sendbuf)) {
                 return;
             }
             curconn.Open(conn.fd, remote_ack_seq, now);
-            conn.fd = -1; // so it won't be closed by caller
+            conn.fd = INVALID_TCP_SOCKET; // so it won't be closed by caller
             // switch to live
             std::swap(grp.conns[i], grp.conns[grp.live_cnt++]);
             static_cast<Derived*>(this)->OnClientLogon(conn.addr, curconn);
@@ -359,7 +355,7 @@ private:
         }
         // no space for new remote name
         strncpy(login_rsp->error_msg, "Max client cnt exceeded", sizeof(login_rsp->error_msg));
-        ::send(conn.fd, sendbuf, sizeof(sendbuf), MSG_NOSIGNAL);
+        tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
     }
 
     // check if seq_start <= ack_seq <= seq_end, considering uint32_t wrap around
@@ -370,7 +366,7 @@ private:
 private:
     char server_name_[Conf::NameSize];
     std::string ptcp_dir_;
-    int listenfd_ = -1;
+    tcp_socket_t listenfd_ = INVALID_TCP_SOCKET;
 
     NewConn new_conns_[Conf::MaxNewConnections];
     int avail_idx_ = 0;
