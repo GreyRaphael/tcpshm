@@ -305,7 +305,7 @@ private:
             vec[0].iov_len = writable;
             vec[1].iov_base = stackbuf;
             vec[1].iov_len = extra_size;
-            ret = tcp_readv(sockfd_, vec, 2);
+            ret = tcp_readv(sockfd_, vec);
         }
         if(ret <= 0) {
             if(ret < 0) {

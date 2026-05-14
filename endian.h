@@ -24,6 +24,7 @@ SOFTWARE.
 
 #pragma once
 #include "os.h"
+#include <bit>
 
 namespace tcpshm {
 
@@ -31,22 +32,17 @@ template<bool ToLittle>
 class Endian
 {
 public:
-#ifdef _WIN32
-    // MSVC targets x86/x64/ARM64 which are always little-endian
-    static constexpr bool IsLittle = true;
-#else
-    static constexpr bool IsLittle = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
-#endif
+    static constexpr bool IsLittle = std::endian::native == std::endian::little;
 
     template<class T>
     static T Convert(T t) {
-        if(ToLittle == IsLittle) return t; // compile time check
+        if constexpr (ToLittle == IsLittle) return t;
 
-        if(sizeof(T) == 2)
+        if constexpr (sizeof(T) == 2)
             return tcp_bswap16((uint16_t)t);
-        else if(sizeof(T) == 4)
+        else if constexpr (sizeof(T) == 4)
             return tcp_bswap32((uint32_t)t);
-        else if(sizeof(T) == 8)
+        else if constexpr (sizeof(T) == 8)
             return tcp_bswap64((uint64_t)t);
         else
             return t;

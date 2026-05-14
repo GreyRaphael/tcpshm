@@ -31,6 +31,7 @@ SOFTWARE.
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
+#include <span>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -182,12 +183,13 @@ struct iovec {
     size_t iov_len;
 };
 
-inline int tcp_readv(tcp_socket_t s, const struct iovec* iov, int iovcnt) {
+inline int tcp_readv(tcp_socket_t s, std::span<struct iovec> vecs) {
   WSABUF bufs[16];
+  int iovcnt = (int)vecs.size();
   if (iovcnt > 16) iovcnt = 16;
   for (int i = 0; i < iovcnt; ++i) {
-    bufs[i].buf = (char*)iov[i].iov_base;
-    bufs[i].len = (ULONG)iov[i].iov_len;
+    bufs[i].buf = (char*)vecs[i].iov_base;
+    bufs[i].len = (ULONG)vecs[i].iov_len;
   }
   DWORD received = 0;
   DWORD flags = 0;
@@ -197,8 +199,8 @@ inline int tcp_readv(tcp_socket_t s, const struct iovec* iov, int iovcnt) {
   return -1;
 }
 #else
-inline int tcp_readv(tcp_socket_t s, const struct iovec* iov, int iovcnt) {
-  return ::readv(s, iov, iovcnt);
+inline int tcp_readv(tcp_socket_t s, std::span<struct iovec> vecs) {
+  return ::readv(s, vecs.data(), (int)vecs.size());
 }
 #endif
 
