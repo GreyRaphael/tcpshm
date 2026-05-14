@@ -282,7 +282,7 @@ private:
         close_errno_ = sys_errno;
     }
 
-    // For Windows: emulate readv scatter-gather by using two recv calls
+    // For Windows: use WSARecv to simulate readv
     int DoRecv() {
         char stackbuf[65536];
         if(readidx_ > 0 && readidx_ == writeidx_) {
@@ -296,23 +296,8 @@ private:
                                        readidx_ + (allow_expand ? Conf::TcpRecvBufMaxSize - recvbuf_size_ : 0));
         if(writable + extra_size == 0) return 0;
         int ret;
-#ifdef _WIN32
-        // Windows: emulate readv with two recv calls
-        if(extra_size == 0) {
-            ret = tcp_recv(sockfd_, &recvbuf_[writeidx_], writable, 0);
-        }
-        else {
-            // First recv into buffer
-            ret = tcp_recv(sockfd_, &recvbuf_[writeidx_], writable, 0);
-            // Try to read extra into stackbuf
-            if(ret > 0 && (uint32_t)ret == writable) {
-                int ret2 = tcp_recv(sockfd_, stackbuf, extra_size, 0);
-                if(ret2 > 0) ret += ret2;
-            }
-        }
-#else
         if(extra_size == 0){
-            ret = ::read(sockfd_, &recvbuf_[writeidx_], writable);
+            ret = tcp_recv(sockfd_, &recvbuf_[writeidx_], writable, 0);
         }
         else {
             struct iovec vec[2];
@@ -320,9 +305,8 @@ private:
             vec[0].iov_len = writable;
             vec[1].iov_base = stackbuf;
             vec[1].iov_len = extra_size;
-            ret = ::readv(sockfd_, vec, 2);
+            ret = tcp_readv(sockfd_, vec, 2);
         }
-#endif
         if(ret <= 0) {
             if(ret < 0) {
                 int err = tcp_get_last_error();

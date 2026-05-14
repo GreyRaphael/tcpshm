@@ -29,6 +29,8 @@ SOFTWARE.
 #include <cerrno>
 #include <cstdlib>
 #include <unordered_map>
+#include <mutex>
+#include <atomic>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -40,7 +42,6 @@ SOFTWARE.
 #include <direct.h>
 #include <intrin.h>
 #pragma comment(lib, "ws2_32.lib")
-#pragma intrinsic(_ReadWriteBarrier)
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -129,6 +130,12 @@ inline int tcp_set_nonblocking(tcp_socket_t s) {
   u_long mode = 1;
   return ::ioctlsocket(s, FIONBIO, &mode);
 }
+
+inline int tcp_set_timeout(tcp_socket_t s, int level, int optname, int timeout_ms) {
+  DWORD dwTimeout = (DWORD)timeout_ms;
+  return ::setsockopt(s, level, optname, (const char*)&dwTimeout, sizeof(dwTimeout));
+}
+
 #else
 inline tcp_socket_t tcp_socket(int af, int type, int proto) {
   return ::socket(af, type, proto);
@@ -160,6 +167,39 @@ inline int tcp_setsockopt(tcp_socket_t s, int level, int optname, const char* op
 inline int tcp_set_nonblocking(tcp_socket_t s) {
   return ::fcntl(s, F_SETFL, O_NONBLOCK);
 }
+
+inline int tcp_set_timeout(tcp_socket_t s, int level, int optname, int timeout_ms) {
+  struct timeval tv;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  return ::setsockopt(s, level, optname, (const void*)&tv, sizeof(tv));
+}
+#endif
+
+#ifdef _WIN32
+struct iovec {
+    void* iov_base;
+    size_t iov_len;
+};
+
+inline int tcp_readv(tcp_socket_t s, const struct iovec* iov, int iovcnt) {
+  WSABUF bufs[16];
+  if (iovcnt > 16) iovcnt = 16;
+  for (int i = 0; i < iovcnt; ++i) {
+    bufs[i].buf = (char*)iov[i].iov_base;
+    bufs[i].len = (ULONG)iov[i].iov_len;
+  }
+  DWORD received = 0;
+  DWORD flags = 0;
+  int ret = WSARecv(s, bufs, iovcnt, &received, &flags, NULL, NULL);
+  if (ret == 0) return (int)received;
+  if (WSAGetLastError() == WSAEWOULDBLOCK) return -1;
+  return -1;
+}
+#else
+inline int tcp_readv(tcp_socket_t s, const struct iovec* iov, int iovcnt) {
+  return ::readv(s, iov, iovcnt);
+}
 #endif
 
 // ============================================================
@@ -176,43 +216,27 @@ inline uint64_t tcp_bswap64(uint64_t x) { return __builtin_bswap64(x); }
 #endif
 
 // ============================================================
-// Compiler barriers (volatile + compiler fence)
+// Synchronization primitives (C++11 memory model)
 // ============================================================
 
-// Force the compiler to read a variable from memory
+// Force the compiler and hardware to read a variable from memory (Acquire)
 template<class T>
-inline T tcp_volatile_read(T& x) {
-  T val;
-#ifdef _WIN32
-  _ReadWriteBarrier();
-  val = *(const volatile T*)&x;
-#else
-  asm volatile("" : "=m"(val) : "m"(x) :);
-  val = x;
-#endif
+inline T tcp_volatile_read(const T& x) {
+  T val = *(const volatile T*)&x;
+  std::atomic_thread_fence(std::memory_order_acquire);
   return val;
 }
 
-// Force the compiler to write a variable to memory
+// Force the compiler and hardware to write a variable to memory (Release)
 template<class T>
 inline void tcp_volatile_write(T& x, const T& val) {
-#ifdef _WIN32
+  std::atomic_thread_fence(std::memory_order_release);
   *(volatile T*)&x = val;
-  _ReadWriteBarrier();
-#else
-  asm volatile("" : : "m"(x), "m"(val) :);
-  x = val;
-  asm volatile("" : : "m"(x) :);
-#endif
 }
 
-#ifdef _WIN32
-inline void tcp_compiler_barrier() { _ReadWriteBarrier(); }
-#else
 inline void tcp_compiler_barrier() {
-  asm volatile("" : : : "memory");
+  std::atomic_signal_fence(std::memory_order_acq_rel);
 }
-#endif
 
 // ============================================================
 // Memory mapping
@@ -220,9 +244,30 @@ inline void tcp_compiler_barrier() {
 
 // On Windows we need to store the file mapping handle for each mmap
 #ifdef _WIN32
-inline std::unordered_map<void*, HANDLE>& get_mmap_handles() {
-  static std::unordered_map<void*, HANDLE> handles;
-  return handles;
+struct MMapManager {
+  std::unordered_map<void*, HANDLE> handles;
+  std::mutex mutex;
+
+  void add(void* addr, HANDLE h) {
+    std::lock_guard<std::mutex> lock(mutex);
+    handles[addr] = h;
+  }
+
+  HANDLE remove(void* addr) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = handles.find(addr);
+    if (it != handles.end()) {
+      HANDLE h = it->second;
+      handles.erase(it);
+      return h;
+    }
+    return NULL;
+  }
+};
+
+inline MMapManager& get_mmap_manager() {
+  static MMapManager manager;
+  return manager;
 }
 
 // Strip leading '/' from SHM names on Windows
@@ -260,7 +305,7 @@ T* my_mmap(const char* filename, bool use_shm, const char** error_msg) {
     CloseHandle(hMap);
     return nullptr;
   }
-  get_mmap_handles()[ret] = hMap;
+  get_mmap_manager().add(ret, hMap);
   return ret;
 #else
   int fd = -1;
@@ -294,12 +339,8 @@ void my_munmap(void* addr) {
 #ifdef _WIN32
   if (addr) {
     UnmapViewOfFile(addr);
-    auto& handles = get_mmap_handles();
-    auto it = handles.find(addr);
-    if (it != handles.end()) {
-      CloseHandle(it->second);
-      handles.erase(it);
-    }
+    HANDLE h = get_mmap_manager().remove(addr);
+    if (h) CloseHandle(h);
   }
 #else
   munmap(addr, sizeof(T));

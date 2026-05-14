@@ -93,18 +93,14 @@ protected:
             static_cast<Derived*>(this)->OnSystemError("socket", tcp_get_last_error());
             return false;
         }
-        struct timeval timeout;
-        timeout.tv_sec = 10;
-        timeout.tv_usec = 0;
-
-        if(tcp_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_RCVTIMEO", tcp_get_last_error());
+        if(tcp_set_timeout(fd, SOL_SOCKET, SO_RCVTIMEO, 10000) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("tcp_set_timeout SO_RCVTIMEO", tcp_get_last_error());
             tcp_close(fd);
             return false;
         }
 
-        if(tcp_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt SO_SNDTIMEO", tcp_get_last_error());
+        if(tcp_set_timeout(fd, SOL_SOCKET, SO_SNDTIMEO, 10000) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("tcp_set_timeout SO_SNDTIMEO", tcp_get_last_error());
             tcp_close(fd);
             return false;
         }
