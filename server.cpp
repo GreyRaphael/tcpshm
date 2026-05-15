@@ -123,7 +123,7 @@ class StringServer : public TSServer {
         for (int i = 0; i < ServerConf::MaxTcpGrps; ++i) {
             threads.emplace_back([this, i]() {
                 while (!stopped.load(std::memory_order_relaxed)) {
-                    PollTcp(GetTimestamp(), i);
+                    PollTcp(get_timestamp(), i);
                     std::this_thread::yield();  // 比固定 sleep 更适合低延迟轮询
                 }
             });
@@ -142,7 +142,7 @@ class StringServer : public TSServer {
         // 主控制循环
         cout << "Server is running on " << ip << ":" << port << "..." << endl;
         while (!stopped.load(std::memory_order_relaxed)) {
-            PollCtl(GetTimestamp());
+            PollCtl(get_timestamp());
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
@@ -150,11 +150,6 @@ class StringServer : public TSServer {
             if (t.joinable()) t.join();
         }
         cout << "Server stopped gracefully." << endl;
-    }
-
-   private:
-    int64_t GetTimestamp() {
-        return std::chrono::steady_clock::now().time_since_epoch().count();
     }
 };
 

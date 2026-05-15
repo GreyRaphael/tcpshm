@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <variant>
@@ -11,6 +12,11 @@ struct CommonConf {
     using LoginUserData = char;
     using LoginRspUserData = char;
 };
+
+// 必须用steady_clock, 否则windows timeout会有问题
+inline int64_t get_timestamp() {
+    return std::chrono::steady_clock::now().time_since_epoch().count();
+}
 
 // for variant dispatch
 template <class... Ts>

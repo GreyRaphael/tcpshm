@@ -48,7 +48,7 @@ class StringClient : public TSClient {
 
     int64_t OnLoginSuccess(const LoginRspMsg* login_rsp) {
         cout << "Login Success" << endl;
-        return GetTimestamp();  // 返回当前纳秒
+        return get_timestamp();  // 返回当前纳秒
     }
 
     void OnServerMsg(MsgHeader* header) {
@@ -85,7 +85,7 @@ class StringClient : public TSClient {
         thread poll_thr([this, use_shm]() {
             while (!conn.IsClosed()) {
                 if (use_shm) PollShm();
-                PollTcp(GetTimestamp());
+                PollTcp(get_timestamp());
                 // 适当休眠防止 100% CPU 占用（如果不追求极致延迟）
                 this_thread::sleep_for(chrono::microseconds(100));
             }
@@ -119,11 +119,6 @@ class StringClient : public TSClient {
         memcpy(header + 1, out.data(), out.size());
 
         conn.Push();
-    }
-
-    // 使用 std::chrono 获取当前纳秒数
-    int64_t GetTimestamp() {
-        return std::chrono::system_clock::now().time_since_epoch().count();
     }
 
     Connection& conn;
