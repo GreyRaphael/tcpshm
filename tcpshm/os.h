@@ -132,6 +132,11 @@ inline int tcp_set_nonblocking(tcp_socket_t s) {
   return ::ioctlsocket(s, FIONBIO, &mode);
 }
 
+inline int tcp_set_blocking(tcp_socket_t s) {
+  u_long mode = 0;
+  return ::ioctlsocket(s, FIONBIO, &mode);
+}
+
 inline int tcp_set_timeout(tcp_socket_t s, int level, int optname, int timeout_ms) {
   DWORD dwTimeout = (DWORD)timeout_ms;
   return ::setsockopt(s, level, optname, (const char*)&dwTimeout, sizeof(dwTimeout));
@@ -169,6 +174,12 @@ inline int tcp_set_nonblocking(tcp_socket_t s) {
   return ::fcntl(s, F_SETFL, O_NONBLOCK);
 }
 
+inline int tcp_set_blocking(tcp_socket_t s) {
+  int flags = ::fcntl(s, F_GETFL, 0);
+  if (flags < 0) return flags;
+  return ::fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
+}
+
 inline int tcp_set_timeout(tcp_socket_t s, int level, int optname, int timeout_ms) {
   struct timeval tv;
   tv.tv_sec = timeout_ms / 1000;
@@ -203,6 +214,34 @@ inline int tcp_readv(tcp_socket_t s, std::span<struct iovec> vecs) {
   return ::readv(s, vecs.data(), (int)vecs.size());
 }
 #endif
+
+inline bool tcp_send_all(tcp_socket_t s, const void* buf, int len, int flags, int* sys_errno) {
+  const char* p = static_cast<const char*>(buf);
+  int sent_total = 0;
+  while (sent_total < len) {
+    int ret = tcp_send(s, p + sent_total, len - sent_total, flags);
+    if (ret <= 0) {
+      if (sys_errno) *sys_errno = ret < 0 ? tcp_get_last_error() : 0;
+      return false;
+    }
+    sent_total += ret;
+  }
+  return true;
+}
+
+inline bool tcp_recv_all(tcp_socket_t s, void* buf, int len, int* sys_errno) {
+  char* p = static_cast<char*>(buf);
+  int recv_total = 0;
+  while (recv_total < len) {
+    int ret = tcp_recv(s, p + recv_total, len - recv_total, 0);
+    if (ret <= 0) {
+      if (sys_errno) *sys_errno = ret < 0 ? tcp_get_last_error() : 0;
+      return false;
+    }
+    recv_total += ret;
+  }
+  return true;
+}
 
 // ============================================================
 // Endian conversion
@@ -337,6 +376,58 @@ T* my_mmap(const char* filename, bool use_shm, const char** error_msg) {
 }
 
 template<class T>
+T* my_mmap_existing(const char* filename, bool use_shm, const char** error_msg) {
+#ifdef _WIN32
+  HANDLE hMap;
+  if (use_shm) {
+    hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, shm_name_win(filename));
+  }
+  else {
+    HANDLE hFile = CreateFileA(filename, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+      *error_msg = "CreateFile";
+      return nullptr;
+    }
+    hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, sizeof(T), NULL);
+    CloseHandle(hFile);
+  }
+  if (hMap == NULL) {
+    *error_msg = "OpenFileMapping";
+    return nullptr;
+  }
+  T* ret = (T*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(T));
+  if (ret == NULL) {
+    *error_msg = "MapViewOfFile";
+    CloseHandle(hMap);
+    return nullptr;
+  }
+  get_mmap_manager().add(ret, hMap);
+  return ret;
+#else
+  int fd = -1;
+  if (use_shm) {
+    fd = shm_open(filename, O_RDWR, 0666);
+  }
+  else {
+    fd = open(filename, O_RDWR, 0644);
+  }
+  if (fd == -1) {
+    *error_msg = "open";
+    return nullptr;
+  }
+  T* ret = (T*)mmap(0, sizeof(T), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (ret == MAP_FAILED) {
+    *error_msg = "mmap";
+    return nullptr;
+  }
+  return ret;
+#endif
+}
+
+template<class T>
 void my_munmap(void* addr) {
 #ifdef _WIN32
   if (addr) {
@@ -346,6 +437,15 @@ void my_munmap(void* addr) {
   }
 #else
   munmap(addr, sizeof(T));
+#endif
+}
+
+inline int my_shm_unlink(const char* filename) {
+#ifdef _WIN32
+  (void)filename;
+  return 0;
+#else
+  return shm_unlink(filename);
 #endif
 }
 

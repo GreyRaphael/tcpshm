@@ -36,6 +36,41 @@ struct HeartbeatMsg
     static const uint16_t msg_type = 0;
 };
 
+constexpr uint64_t ShmProbeAckMask = 0x5a5a5a5a5a5a5a5aULL;
+constexpr uint32_t ShmProbeNameSize = 64;
+
+struct ShmProbeData
+{
+    uint64_t token;
+    uint64_t ack;
+};
+
+struct ShmProbeReqMsg
+{
+    static const uint16_t msg_type = 3;
+    uint64_t token;
+    char shm_name[ShmProbeNameSize];
+
+    template<bool ToLittle>
+    void ConvertByteOrder() {
+        Endian<ToLittle> ed;
+        ed.ConvertInPlace(token);
+    }
+};
+
+struct ShmProbeRspMsg
+{
+    static const uint16_t msg_type = 4;
+    uint64_t ack;
+    char ok;
+
+    template<bool ToLittle>
+    void ConvertByteOrder() {
+        Endian<ToLittle> ed;
+        ed.ConvertInPlace(ack);
+    }
+};
+
 // Note that we allow user to reuse msg_type 1 and 2
 // Because LoginMsg and LoginRspMsg are expected only at the beginning of a connection
 template<class Conf>

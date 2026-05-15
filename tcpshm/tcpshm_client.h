@@ -82,12 +82,14 @@ protected:
         login->use_shm = use_shm;
         login->client_seq_start = login->client_seq_end = 0;
         login->user_data = login_user_data;
-        if(server_name_[0] &&
+        bool opened_conn_file = false;
+        if(server_name_[0] && !use_shm &&
            (!conn_.OpenFile(use_shm, &error_msg) ||
             !conn_.GetSeq(&sendbuf[0].ack_seq, &login->client_seq_start, &login->client_seq_end, &error_msg))) {
             static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
             return false;
         }
+        opened_conn_file = server_name_[0] && !use_shm;
         tcp_socket_t fd;
         if((fd = tcp_socket(AF_INET, SOCK_STREAM, 0)) == INVALID_TCP_SOCKET) {
             static_cast<Derived*>(this)->OnSystemError("socket", tcp_get_last_error());
@@ -125,23 +127,21 @@ protected:
 
         sendbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
         login->ConvertByteOrder();
-        int ret = tcp_send(fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
-        if(ret != (int)sizeof(sendbuf)) {
-            static_cast<Derived*>(this)->OnSystemError("send", ret < 0 ? tcp_get_last_error() : 0);
+        int sys_errno = 0;
+        if(!tcp_send_all(fd, sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL, &sys_errno)) {
+            static_cast<Derived*>(this)->OnSystemError("send", sys_errno);
             tcp_close(fd);
             return false;
         }
 
         MsgHeader recvbuf[1 + (sizeof(LoginRspMsg) + 7) / 8];
-        ret = tcp_recv(fd, (char*)recvbuf, sizeof(recvbuf), 0);
-        if(ret != (int)sizeof(recvbuf)) {
-            static_cast<Derived*>(this)->OnSystemError("recv", ret < 0 ? tcp_get_last_error() : 0);
+        const char* recv_error = nullptr;
+        if(!RecvLoginRsp(fd, recvbuf, &recv_error, &sys_errno)) {
+            static_cast<Derived*>(this)->OnSystemError(recv_error, sys_errno);
             tcp_close(fd);
             return false;
         }
         LoginRspMsg* login_rsp = (LoginRspMsg*)(recvbuf + 1);
-        recvbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
-        login_rsp->ConvertByteOrder();
         if(recvbuf[0].size != sizeof(MsgHeader) + sizeof(LoginRspMsg) || recvbuf[0].msg_type != LoginRspMsg::msg_type ||
            login_rsp->server_name[0] == 0) {
             static_cast<Derived*>(this)->OnSystemError("Invalid LoginRsp", 0);
@@ -167,15 +167,21 @@ protected:
         }
         login_rsp->server_name[sizeof(login_rsp->server_name) - 1] = 0;
         // check if server name has changed
-        if(strncmp(server_name_, login_rsp->server_name, sizeof(ServerName)) != 0) {
+        bool server_name_changed = strncmp(server_name_, login_rsp->server_name, sizeof(ServerName)) != 0;
+        if(server_name_changed) {
             conn_.Release();
             strncpy(server_name_, login_rsp->server_name, sizeof(ServerName));
             strncpy(conn_.GetRemoteName(), server_name_, sizeof(ServerName));
+            opened_conn_file = false;
+        }
+        if(!opened_conn_file) {
             if(!conn_.OpenFile(use_shm, &error_msg)) {
                 static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
                 tcp_close(fd);
                 return false;
             }
+        }
+        if(server_name_changed) {
             conn_.Reset();
         }
         tcp_set_nonblocking(fd);
@@ -219,6 +225,99 @@ protected:
     }
 
 private:
+    static bool RecvLoginRsp(tcp_socket_t fd,
+                             MsgHeader* recvbuf,
+                             const char** error_msg,
+                             int* sys_errno) {
+        MsgHeader header;
+        if(!RecvHeader(fd, &header, error_msg, sys_errno)) return false;
+
+        if(header.msg_type == ShmProbeReqMsg::msg_type) {
+            if(!HandleShmProbe(fd, header, error_msg, sys_errno)) return false;
+            if(!RecvHeader(fd, &header, error_msg, sys_errno)) return false;
+        }
+
+        if(header.size != sizeof(MsgHeader) + sizeof(LoginRspMsg) ||
+           header.msg_type != LoginRspMsg::msg_type) {
+            *error_msg = "Invalid LoginRsp";
+            if(sys_errno) *sys_errno = 0;
+            return false;
+        }
+
+        recvbuf[0] = header;
+        constexpr int BodyBufSize = ((sizeof(LoginRspMsg) + 7) / 8) * 8;
+        if(!tcp_recv_all(fd, recvbuf + 1, BodyBufSize, sys_errno)) {
+            *error_msg = "recv";
+            return false;
+        }
+        LoginRspMsg* login_rsp = (LoginRspMsg*)(recvbuf + 1);
+        login_rsp->ConvertByteOrder();
+        return true;
+    }
+
+    static bool RecvHeader(tcp_socket_t fd,
+                           MsgHeader* header,
+                           const char** error_msg,
+                           int* sys_errno) {
+        if(!tcp_recv_all(fd, header, sizeof(*header), sys_errno)) {
+            *error_msg = "recv";
+            return false;
+        }
+        header->template ConvertByteOrder<Conf::ToLittleEndian>();
+        return true;
+    }
+
+    static bool HandleShmProbe(tcp_socket_t fd,
+                               const MsgHeader& header,
+                               const char** error_msg,
+                               int* sys_errno) {
+        if(header.size != sizeof(MsgHeader) + sizeof(ShmProbeReqMsg)) {
+            *error_msg = "Invalid ShmProbeReq";
+            if(sys_errno) *sys_errno = 0;
+            return false;
+        }
+
+        MsgHeader probebuf[1 + (sizeof(ShmProbeReqMsg) + 7) / 8];
+        probebuf[0] = header;
+        constexpr int ProbeBodyBufSize = ((sizeof(ShmProbeReqMsg) + 7) / 8) * 8;
+        if(!tcp_recv_all(fd, probebuf + 1, ProbeBodyBufSize, sys_errno)) {
+            *error_msg = "recv";
+            return false;
+        }
+
+        ShmProbeReqMsg* req = (ShmProbeReqMsg*)(probebuf + 1);
+        req->template ConvertByteOrder<Conf::ToLittleEndian>();
+        req->shm_name[ShmProbeNameSize - 1] = 0;
+
+        uint64_t ack = 0;
+        char ok = 0;
+        const char* mmap_error = nullptr;
+        ShmProbeData* probe = my_mmap_existing<ShmProbeData>(req->shm_name, true, &mmap_error);
+        if(probe) {
+            if(probe->token == req->token) {
+                ack = req->token ^ ShmProbeAckMask;
+                tcp_volatile_write(probe->ack, ack);
+                ok = 1;
+            }
+            my_munmap<ShmProbeData>(probe);
+        }
+
+        MsgHeader rspbuf[1 + (sizeof(ShmProbeRspMsg) + 7) / 8]{};
+        rspbuf[0].size = sizeof(MsgHeader) + sizeof(ShmProbeRspMsg);
+        rspbuf[0].msg_type = ShmProbeRspMsg::msg_type;
+        rspbuf[0].ack_seq = 0;
+        ShmProbeRspMsg* rsp = (ShmProbeRspMsg*)(rspbuf + 1);
+        rsp->ack = ack;
+        rsp->ok = ok;
+        rspbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
+        rsp->template ConvertByteOrder<Conf::ToLittleEndian>();
+        if(!tcp_send_all(fd, rspbuf, sizeof(rspbuf), TCP_MSG_NOSIGNAL, sys_errno)) {
+            *error_msg = "send";
+            return false;
+        }
+        return true;
+    }
+
     char client_name_[Conf::NameSize];
     using ServerName = std::array<char, Conf::NameSize>;
     char* server_name_ = nullptr;

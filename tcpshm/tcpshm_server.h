@@ -24,6 +24,8 @@ SOFTWARE.
 
 #pragma once
 #include <string>
+#include <chrono>
+#include <cstdio>
 #include "os.h"
 #include "tcpshm_conn.h"
 
@@ -254,10 +256,10 @@ private:
 
     template<uint32_t N>
     void HandleLogin(int64_t now, NewConn& conn, ConnectionGroup<N>* grps) {
-        MsgHeader sendbuf[1 + (sizeof(LoginRspMsg) + 7) / 8];
+        MsgHeader sendbuf[1 + (sizeof(LoginRspMsg) + 7) / 8]{};
         sendbuf[0].size = sizeof(MsgHeader) + sizeof(LoginRspMsg);
         sendbuf[0].msg_type = LoginRspMsg::msg_type;
-        sendbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
+        sendbuf[0].ack_seq = 0;
         LoginRspMsg* login_rsp = (LoginRspMsg*)(sendbuf + 1);
         strncpy(login_rsp->server_name, server_name_, sizeof(login_rsp->server_name));
         login_rsp->status = 2;
@@ -266,16 +268,22 @@ private:
         LoginMsg* login = (LoginMsg*)(conn.recvbuf + 1);
         if(login->client_name[0] == 0) {
             strncpy(login_rsp->error_msg, "Invalid client name", sizeof(login_rsp->error_msg));
-            tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+            SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
         login->client_name[sizeof(login->client_name) - 1] = 0;
+        if(login->use_shm && !VerifyShmProbe(conn.fd, login->client_name)) {
+            strncpy(login_rsp->error_msg, "SHM probe failed", sizeof(login_rsp->error_msg));
+            SendLoginRsp(conn.fd, sendbuf, login_rsp);
+            return;
+        }
+
         int grpid = static_cast<Derived*>(this)->OnNewConnection(conn.addr, login, login_rsp);
         if(grpid < 0) {
             if(login_rsp->error_msg[0] == 0) { // user didn't set error_msg? set a default one
                 strncpy(login_rsp->error_msg, "Login Reject", sizeof(login_rsp->error_msg));
             }
-            tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+            SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
         auto& grp = grps[grpid];
@@ -292,7 +300,7 @@ private:
             // match
             if(i < grp.live_cnt) {
                 strncpy(login_rsp->error_msg, "Already loggned on", sizeof(login_rsp->error_msg));
-                tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+                SendLoginRsp(conn.fd, sendbuf, login_rsp);
                 return;
             }
 
@@ -301,7 +309,7 @@ private:
                 // we can not mmap to ptcp or chm files with filenames related to local and remote name
                 static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
                 strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg));
-                tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+                SendLoginRsp(conn.fd, sendbuf, login_rsp);
                 return;
             }
             uint32_t local_ack_seq = 0;
@@ -319,14 +327,13 @@ private:
                 if(!curconn.GetSeq(&local_ack_seq, &local_seq_start, &local_seq_end, &error_msg)) {
                     static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
                     strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg));
-                    tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+                    SendLoginRsp(conn.fd, sendbuf, login_rsp);
                     return;
                 }
             }
-            sendbuf[0].ack_seq = Endian<Conf::ToLittleEndian>::Convert(local_ack_seq);
+            sendbuf[0].ack_seq = local_ack_seq;
             login_rsp->server_seq_start = local_seq_start;
             login_rsp->server_seq_end = local_seq_end;
-            login_rsp->ConvertByteOrder();
             if(!CheckAckInQueue(remote_ack_seq, local_seq_start, local_seq_end) ||
                !CheckAckInQueue(local_ack_seq, remote_seq_start, remote_seq_end)) {
                 static_cast<Derived*>(this)->OnSeqNumberMismatch(curconn,
@@ -337,15 +344,16 @@ private:
                                                                  remote_seq_start,
                                                                  remote_seq_end);
                 login_rsp->status = 1;
-                tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+                SendLoginRsp(conn.fd, sendbuf, login_rsp);
                 return;
             }
 
             // send Login OK
             login_rsp->status = 0;
-            if(tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL) != (int)sizeof(sendbuf)) {
+            if(!SendLoginRsp(conn.fd, sendbuf, login_rsp)) {
                 return;
             }
+            tcp_set_nonblocking(conn.fd);
             curconn.Open(conn.fd, remote_ack_seq, now);
             conn.fd = INVALID_TCP_SOCKET; // so it won't be closed by caller
             // switch to live
@@ -355,12 +363,92 @@ private:
         }
         // no space for new remote name
         strncpy(login_rsp->error_msg, "Max client cnt exceeded", sizeof(login_rsp->error_msg));
-        tcp_send(conn.fd, (const char*)sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL);
+        SendLoginRsp(conn.fd, sendbuf, login_rsp);
     }
 
     // check if seq_start <= ack_seq <= seq_end, considering uint32_t wrap around
     bool CheckAckInQueue(uint32_t ack_seq, uint32_t seq_start, uint32_t seq_end) {
         return (int)(ack_seq - seq_start) >= 0 && (int)(seq_end - ack_seq) >= 0;
+    }
+
+    static bool SendLoginRsp(tcp_socket_t fd, const MsgHeader* header, const LoginRspMsg* login_rsp) {
+        MsgHeader outbuf[1 + (sizeof(LoginRspMsg) + 7) / 8]{};
+        outbuf[0] = *header;
+        LoginRspMsg* out_rsp = (LoginRspMsg*)(outbuf + 1);
+        *out_rsp = *login_rsp;
+        outbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
+        out_rsp->ConvertByteOrder();
+        int sys_errno = 0;
+        return tcp_send_all(fd, outbuf, sizeof(outbuf), TCP_MSG_NOSIGNAL, &sys_errno);
+    }
+
+    bool VerifyShmProbe(tcp_socket_t fd, const char* client_name) {
+        tcp_set_blocking(fd);
+        tcp_set_timeout(fd, SOL_SOCKET, SO_RCVTIMEO, 3000);
+        tcp_set_timeout(fd, SOL_SOCKET, SO_SNDTIMEO, 3000);
+
+        uint64_t token = MakeShmProbeToken(client_name);
+        char probe_name[ShmProbeNameSize]{};
+        std::snprintf(probe_name,
+                      sizeof(probe_name),
+                      "/tcpshm_probe_%s_%s_%llx",
+                      server_name_,
+                      client_name,
+                      static_cast<unsigned long long>(token));
+
+        const char* error_msg = nullptr;
+        ShmProbeData* probe = my_mmap<ShmProbeData>(probe_name, true, &error_msg);
+        if(!probe) return false;
+        probe->token = token;
+        probe->ack = 0;
+
+        bool ok = SendShmProbeReq(fd, probe_name, token) &&
+                  RecvAndCheckShmProbeRsp(fd, token, probe);
+
+        my_munmap<ShmProbeData>(probe);
+        my_shm_unlink(probe_name);
+        return ok;
+    }
+
+    bool SendShmProbeReq(tcp_socket_t fd, const char* probe_name, uint64_t token) {
+        MsgHeader reqbuf[1 + (sizeof(ShmProbeReqMsg) + 7) / 8]{};
+        reqbuf[0].size = sizeof(MsgHeader) + sizeof(ShmProbeReqMsg);
+        reqbuf[0].msg_type = ShmProbeReqMsg::msg_type;
+        reqbuf[0].ack_seq = 0;
+        ShmProbeReqMsg* req = (ShmProbeReqMsg*)(reqbuf + 1);
+        req->token = token;
+        strncpy(req->shm_name, probe_name, sizeof(req->shm_name) - 1);
+        reqbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
+        req->template ConvertByteOrder<Conf::ToLittleEndian>();
+        int sys_errno = 0;
+        return tcp_send_all(fd, reqbuf, sizeof(reqbuf), TCP_MSG_NOSIGNAL, &sys_errno);
+    }
+
+    bool RecvAndCheckShmProbeRsp(tcp_socket_t fd, uint64_t token, ShmProbeData* probe) {
+        MsgHeader rspbuf[1 + (sizeof(ShmProbeRspMsg) + 7) / 8]{};
+        int sys_errno = 0;
+        if(!tcp_recv_all(fd, rspbuf, sizeof(rspbuf), &sys_errno)) return false;
+        rspbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
+        if(rspbuf[0].size != sizeof(MsgHeader) + sizeof(ShmProbeRspMsg) ||
+           rspbuf[0].msg_type != ShmProbeRspMsg::msg_type) {
+            return false;
+        }
+        ShmProbeRspMsg* rsp = (ShmProbeRspMsg*)(rspbuf + 1);
+        rsp->template ConvertByteOrder<Conf::ToLittleEndian>();
+        uint64_t expected_ack = token ^ ShmProbeAckMask;
+        return rsp->ok &&
+               rsp->ack == expected_ack &&
+               tcp_volatile_read(probe->ack) == expected_ack;
+    }
+
+    uint64_t MakeShmProbeToken(const char* client_name) const {
+        uint64_t now = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        uint64_t salt = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(this));
+        for(const char* p = client_name; *p; ++p) {
+            salt = (salt * 131) + static_cast<unsigned char>(*p);
+        }
+        return now ^ (salt << 17) ^ (salt >> 7);
     }
 
 private:
