@@ -79,7 +79,12 @@ class StringClient : public TSClient {
     // --- 业务逻辑 ---
 
     void Run(const char* server_ip, uint16_t port, bool use_shm) {
-        if (!Connect(use_shm, server_ip, port, 0)) return;
+#ifdef _WIN32
+        constexpr auto local_platform = Platform::Windows;
+#else
+        constexpr auto local_platform = Platform::Linux;
+#endif
+        if (!Connect(use_shm, server_ip, port, local_platform)) return;
 
         // 轮询线程：不再使用 cpupin，降低对系统的独占
         thread poll_thr([this, use_shm]() {
