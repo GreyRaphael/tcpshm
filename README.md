@@ -21,7 +21,19 @@ This is a framework in that it provides a server side and client side C++ templa
   * No writing to stdout/stderror or log file
   * No use of mutex or atomic operations
   * Yes, it's lightweight, clean and efficient
-  
+
+## use-shm 探测
+
+1. client TCP 登录，请求 prefer_shm=1
+2. server 发现 client 想用 shm
+3. server 创建临时共享内存，例如 /tcpshm_probe_xxx
+4. server 写入随机 token
+5. server 通过 TCP 把 probe name 发给 client
+6. client 尝试 open 这个 shm，不允许 create，只能 open existing
+7. client 读到正确 token 后，通过 TCP 回 ACK
+8. server 收到 ACK 后，才允许 use_shm=1
+9. 否则拒绝登录
+
 ## Limitations
   * It won't persist data on disk, so it can't recover from power down
   * As it's non-blocking and busy polling for the purpose of low latency, CPU usage would be high and a large number of live connections would downgrade the performance(say, more than 1000).
