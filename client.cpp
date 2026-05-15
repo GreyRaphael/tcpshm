@@ -130,10 +130,11 @@ class StringClient : public TSClient {
 };
 
 int main(int argc, const char** argv) {
-    if (argc < 2) {
-        std::cout << "usage: ./client name\n";
+    if (argc < 3) {
+        std::cout << "usage: ./client name use_shm[0|1]\n";
         return -1;
     }
     StringClient client(argv[1], argv[1]);
-    client.Run("127.0.0.1", 12345, false);
+    bool use_shm = argv[2][0] != '0';
+    client.Run("127.0.0.1", 12345, use_shm);
 }
