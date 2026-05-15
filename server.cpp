@@ -61,21 +61,6 @@ class StringServer : public TSServer {
     }
 
     int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* login_rsp) {
-        if (login->use_shm) {
-#ifdef _WIN32
-            constexpr auto local_platform = Platform::Windows;
-#else
-            constexpr auto local_platform = Platform::Linux;
-#endif
-            if (login->user_data != local_platform) {
-                // server, client分属windows Linux
-                login_rsp->status = 2;
-                strncpy(login_rsp->error_msg, "SHM requires same platform", sizeof(login_rsp->error_msg));
-                return -1;
-            }
-            // 还应该继续判断是否同机，否则 Linux-Linux 跨机器也会误开 shm。
-        }
-
         cout << "New Connection: " << login->client_name << " from " << inet_ntoa(addr.sin_addr) << ", use_shm=" << (bool)login->use_shm << endl;
         // 简单映射到 group 0
         return 0;

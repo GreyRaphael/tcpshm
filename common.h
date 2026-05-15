@@ -4,17 +4,12 @@
 #include <string>
 #include <variant>
 
-enum class Platform : uint8_t {
-    Windows = 1,
-    Linux = 2,
-};
-
 struct CommonConf {
     static const uint32_t NameSize = 16;
     static const uint32_t ShmQueueSize = 1024 * 1024;  // must be power of 2
     static const bool ToLittleEndian = true;           // set to the endian of majority of the hosts
 
-    using LoginUserData = Platform;
+    using LoginUserData = char;
     using LoginRspUserData = char;
 };
 
