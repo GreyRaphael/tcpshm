@@ -8,8 +8,8 @@
 #include <variant>
 
 #include "common.h"
-#include "msg_header.h"
-#include "tcpshm_client.h"
+#include "tcpshm/msg_header.h"
+#include "tcpshm/tcpshm_client.h"
 
 using namespace std;
 using namespace tcpshm;

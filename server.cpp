@@ -12,8 +12,8 @@
 #include <vector>
 
 #include "common.h"
-#include "msg_header.h"
-#include "tcpshm_server.h"
+#include "tcpshm/msg_header.h"
+#include "tcpshm/tcpshm_server.h"
 
 using namespace std;
 using namespace tcpshm;
