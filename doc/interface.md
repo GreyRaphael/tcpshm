@@ -1,308 +1,308 @@
-tcpshm
-======
+[English](interface.md) | [中文](interface-CN.md)
 
-## MsgHeader and TcpShmConnection
-Every msg has a `MsgHeader` automatically appended, regardless of control msg or app msg, it's a 8 byte structure in host endian:
+tcpshm Interface Documentation
+==============================
+
+`tcpshm` is a high-performance, connection-oriented persistent message queue framework written in modern C++ (C++20/C++23) supporting both **Linux and Windows**.
+
+## MsgHeader and Reserved Message Types
+
+Every message has an 8-byte `MsgHeader` automatically prepended, regardless of control message or application message, in host endianness:
 
 ```c++
 struct MsgHeader
 {
-    // size of this msg, including header itself
+    // size of this msg, including header itself (max 65535)
     // auto set by lib, can be read by user
     uint16_t size;
-    // msg type of app msg is set by user and must not be 0
+    // msg type of app msg is set by user
     uint16_t msg_type;
-    // internally used for ptcp, must not be modified by user
+    // internally used for ptcp sequence and ack, must not be modified by user
     uint32_t ack_seq;
+
+    template<bool ToLittle>
+    void ConvertByteOrder();
 };
 ```
-The framework will apply endian conversion on MsgHeader automatically(check ToLittleEndian below) if sending over tcp channel.
 
-TcpShmConnection is a general connection class that we can use to send or recv msgs.
-**Note that reading/writing msgs on one connection must happen in the same thread: its polling thread(see [Limitations](https://github.com/MengRao/tcpshm#limitations)).**
-For sending, user calls Alloc() to allocate space to save a msg:
+The framework automatically applies `std::endian`-based byte-order conversion on `MsgHeader` if sending over the TCP channel (`ToLittleEndian` configuration).
+
+### Reserved `msg_type` IDs
+When defining application messages, note the following internal reserved or special message types:
+* `0`: `HeartbeatMsg` (Internal heartbeat ping/pong sent during connection idle intervals).
+* `3`: `ShmProbeReqMsg` (Internal SHM probe request sent by server to verify physical shared memory accessibility).
+* `4`: `ShmProbeRspMsg` (Internal SHM probe response returned by client).
+* `1` & `2`: `LoginMsg` (`msg_type=1`) and `LoginRspMsg` (`msg_type=2`). These are used during the initial connection login phase. **Once the login handshake completes (`OnLoginSuccess` / `OnClientLogon`), application messages are free to reuse `msg_type = 1` and `msg_type = 2` safely.**
+
+---
+
+## TcpShmConnection Class
+
+`TcpShmConnection` is the core connection abstraction encapsulating either TCP (`PTCPConnection`) or Shared Memory (`SPSCVarQueue`).
+
+**Note: Reading/writing messages on a single connection must happen in the same thread: its designated polling thread.**
+
+### Sending Messages
+To send a message, allocate space in the send queue using `Alloc()`:
 
 ```c++
-    // allocate a msg of specified size in send queue
-    // the returned address is guaranteed to be 8 byte aligned
-    // return nullptr if no enough space
-    MsgHeader* Alloc(uint16_t size);
+// allocate a msg of specified size in send queue
+// the returned address is guaranteed to be 8-byte aligned
+// return nullptr if buffer space is full
+MsgHeader* Alloc(uint16_t size);
 ```
 
-In the returned `MsgHeader` pointer, user need to set msg_type field and the msg content(it's user's responsibility to take care of the endian for msg content) after the header, then call Push() to submit and send out the msg.
-If user have multiple msgs to send in a row, it's better to use PushMore() for first several msgs and Push() for the last one:
+In the returned `MsgHeader` pointer, set the `msg_type` field and copy your message payload (e.g., C struct or serialized Protobuf bytes) immediately after the header (`header + 1`). Then call `Push()` or `PushMore()` to submit:
+
 ```c++
-    // submit the last msg from Alloc() and send out
-    void Push();
+// submit the last msg from Alloc() and send out immediately
+void Push();
 
-    // for shm, same as Push
-    // for tcp, don't send out immediately as we have more to push
-    void PushMore();
+// for shm, same as Push()
+// for tcp, buffers and does not flush out immediately (useful when sending multiple msgs in a batch)
+void PushMore();
 ```
 
-For receiving, user calls Front() to get the first app msg in receive queue, but normally Front() should be automatically called by framework in polling functions:
+### Receiving Messages
+Polling functions (`PollTcp` / `PollShm`) check for incoming messages and call your `OnServerMsg` or `OnClientMsg` callback when data arrives. Inside your callback, `Front()` yields the current message and `Pop()` consumes it:
+
 ```c++
-    // get the next msg from recv queue, return nullptr if queue is empty
-    // the returned address is guaranteed to be 8 byte aligned
-    // if caller dont call Pop() later, it will get the same msg again
-    // user dont need to call Front() directly as polling functions will do it
-    MsgHeader* Front();
+// get the next msg from recv queue, return nullptr if queue is empty
+// the returned address is guaranteed to be 8-byte aligned
+MsgHeader* Front();
+
+// consume the msg we got from Front() or polling callback
+void Pop();
 ```
-If returned `MsgHeader` is not nullptr, user can identify basic msg info from its msg_type and size and handle msg content after `MsgHeader`.
-If user finishes handling the msg, it should call Pop() to consume it, otherwise user will get the same msg again from the next Front():
+
+> **Best Practice for Request-Response Handling:**  
+> When handling a message from `Front()` and immediately sending back a response, call `Pop()` first and then `Alloc()/Push()`:
+> 1. For TCP, `Push()` sends to the network socket immediately. Calling `Pop()` before `Push()` piggybacks the updated `ack_seq` on the response message, confirming consumption faster to the remote peer.
+> 2. If a crash occurs between `Pop()` and `Push()`, the received message is marked as consumed, preventing duplicate message processing on recovery.
+
+### Connection Metadata & Control
+You can query and manage the connection state anytime using the following methods:
+
 ```c++
-    // consume the msg we got from Front() or polling function
-    void Pop();
+// check if underlying socket/queue is closed
+bool IsClosed();
+
+// request closing the connection
+void Close();
+
+// get close reason string and system errno
+const char* GetCloseReason(int* sys_errno);
+
+// get remote and local connection names
+char* GetRemoteName();
+const char* GetLocalName();
+
+// get the directory of ptcp persistence files
+const char* GetPtcpDir();
+std::string GetPtcpFile();
 ```
 
-In a typical scenario that on handling a msg, user wants to send back a response msg immediately, he should call Pop() and Push() in a row instead of the reverse, in that:
-1) for tcp, Push() will send to the network which would be slow, so if we do the reverse there's a chance that when program crashes the Pushed msg is persisted in sending queue but Pop() is not called, so on recovery it'll handle the same msg again and push a duplicate response. If we do Pop() and Push() there's still a chance that Pop() succeeds but Push() doesn't(miss sending a response), but that's only a theoretical chance, you can test the EchoServer example.  
-2) for tcp, if we call Pop() and Push(), the updated ack seq(due to Pop()) will be piggybacked by the response msg(due to Push()), which means the remote side will get the update more quickly.
+In your application, you do not instantiate `TcpShmConnection` directly; instead, you obtain a reference from `GetConnection()` on the client side or via `OnClientLogon / OnClientMsg` on the server side.
 
-User can close the connection and the remote side will get the disconnect notification.
-```c++
-    // Close this connection
-    void Close();
-```
+---
 
-In application, user is not allowed to create TcpShmConnection but can get a reference to it from client or server framework, and this reference is guaranteed to be valid until server/client is stopped, this allows user to send msgs even when it's disconnected, and remote side will get them once connection is re-established. 
+## Configuration (`Conf`)
 
-Connection related configuration are as below:
+Both client and server rely on a `Conf` struct (or `CommonConf` base) to define sizes, timeouts, and custom data types:
+
 ```c++
 struct Conf
 {
-    // the size of client/server name in chars, including the ending null
-    static const uint32_t NameSize = 16;
+    // the size of client/server name in chars, including ending null
+    static constexpr uint32_t NameSize = 16;
     
-    // shm queue size, must be a power of 2
-    static const uint32_t ShmQueueSize = 2048;
+    // shm ring-buffer queue size in bytes, must be a power of 2
+    static constexpr uint32_t ShmQueueSize = 1024 * 1024;
 
-    // set to the endian of majority of the hosts, e.g. true for x86
-    static const bool ToLittleEndian = true; 
+    // set to the endian of majority of the hosts (e.g. true for x86/x64)
+    static constexpr bool ToLittleEndian = true; 
 
-    // tcp send queue size, must be a multiple of 8
-    static const uint32_t TcpQueueSize = 2000; 
+    // tcp send queue size in bytes, must be a multiple of 8
+    static constexpr uint32_t TcpQueueSize = 3000; 
 
-    // tcp recv buff init size(recv buffer is allocated when tcp connection is established), must be a multiple of 8
-    static const uint32_t TcpRecvBufInitSize = 2000;
+    // tcp recv buffer init and max sizes, must be multiples of 8
+    static constexpr uint32_t TcpRecvBufInitSize = 1000;
+    static constexpr uint32_t TcpRecvBufMaxSize = 2000;
 
-    // tcp recv buff max size(recv buffer can expand when needed), must be a multiple of 8
-    static const uint32_t TcpRecvBufMaxSize = 8000;
+    // enable TCP_NODELAY option
+    static constexpr bool TcpNoDelay = true;
 
-    // if enable TCP_NODELAY
-    static const bool TcpNoDelay = true;
+    // connection timeout and heartbeat interval, measured in user-provided timestamps (e.g. nanoseconds)
+    static constexpr int64_t ConnectionTimeout = 10LL * 1000000000LL;
+    static constexpr int64_t HeartBeatInverval = 3LL * 1000000000LL;
 
-    // tcp connection timeout, measured in user provided timestamp
-    static const int64_t ConnectionTimeout = 10;
-
-    // delay of heartbeat msg after the last tcp msg send time, measured in user provided timestamp
-    static const int64_t HeartBeatInverval = 3;
-
-    // user defined data in LoginMsg, e.g. username, password..., take care of the endian
+    // user defined data structures attached to LoginMsg / LoginRspMsg / Connection
     using LoginUserData = char;
-
-    // user defined data in LoginRspMsg, take care of the endian
     using LoginRspUserData = char;
-
-    // user defined data in TcpShmConnection class
     using ConnectionUserData = char;
 };
 ```
 
+---
 
-## Client Side
-tcpshm_client.h defines template Class `TcpShmClient`, user need to defines a new Class that derives from `TcpShmClient` and provides a configuration template class, and also a client name and ptcp folder name for TcpShmClient's constructor. The client name is used combined with server name to uniquely identify a connection, and the ptcp folder is used by the framework to persist some internal files including the tcp queue file.
+## Client Side (`TcpShmClient`)
+
+To implement a client, derive from `TcpShmClient<MyClient, Conf>` and define **public** callback methods:
 
 ```c++
 #include "tcpshm/tcpshm_client.h"
 
-struct Conf
-{
-    // Connection related Conf
-    ...
-};
-
-class MyClient;
-using TSClient = tcpshm::TcpShmClient<MyClient, Conf>;
-
-class MyClient : public TSClient 
+class MyClient : public tcpshm::TcpShmClient<MyClient, Conf>
 {
 public:
     MyClient(const std::string& ptcp_dir, const std::string& name)
-        : TSClient(ptcp_dir, name)
-...
+        : TcpShmClient(ptcp_dir, name), conn_(GetConnection()) {}
+
+    // --- Public Callback Functions ---
+
+    void OnSystemError(const char* error_msg, int sys_errno) {
+        std::cout << "System Error: " << error_msg << " errno: " << sys_errno << std::endl;
+    }
+
+    void OnLoginReject(const LoginRspMsg* login_rsp) {
+        std::cout << "Login Rejected: " << login_rsp->error_msg << std::endl;
+    }
+
+    int64_t OnLoginSuccess(const LoginRspMsg* login_rsp) {
+        std::cout << "Login Success with server: " << login_rsp->server_name << std::endl;
+        return get_timestamp(); // return current timestamp in nanoseconds
+    }
+
+    void OnServerMsg(MsgHeader* header) {
+        // handle message data at header + 1
+        conn_.Pop();
+    }
+
+    void OnDisconnected(const char* reason, int sys_errno) {
+        std::cout << "Disconnected: " << reason << std::endl;
+    }
+
+    void OnSeqNumberMismatch(uint32_t local_ack, uint32_t local_start, uint32_t local_end,
+                             uint32_t remote_ack, uint32_t remote_start, uint32_t remote_end) {
+        std::cout << "Sequence mismatch detected." << std::endl;
+    }
+
+    // --- Connection Lifecycle & Polling ---
+
+    void Run(const char* server_ip, uint16_t port, bool use_shm) {
+        if (!Connect(use_shm, server_ip, port, 0)) return;
+
+        // poll in loop until connection closes
+        while (!conn_.IsClosed()) {
+            if (use_shm) PollShm();
+            PollTcp(get_timestamp());
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        Stop();
+    }
+
+private:
+    Connection& conn_;
+};
 ```
 
-Then user can call Connect() to login to the server:
+### Client Methods Summary
+* `bool Connect(bool use_shm, const char* server_ipv4, uint16_t server_port, const LoginUserData& login_user_data)`: Connects, executes SHM probe handshake if `use_shm=true`, and logs in.
+* `Connection& GetConnection()`: Returns the persistent connection reference.
+* `void PollTcp(int64_t now)`: Serves TCP data, heartbeats, and handles disconnections. Must be called even in SHM mode.
+* `void PollShm()`: Polls the lock-free shared memory queue for messages.
+* `void Stop()`: Safely closes files and stops the client.
 
-```c++
-    // connect and login to server, may block for a short time
-    // return true if success
-    bool Connect(bool use_shm, // if using shm to transfer application msg
-                 const char* server_ipv4, // server ip
-                 uint16_t server_port, // server port
-                 const typename Conf::LoginUserData& login_user_data //user defined login data to be copied into LoginMsg
-                );
-```
+---
 
-If Login successful, user can get the Connection reference to send msgs:
+## Server Side (`TcpShmServer`)
 
-```c++
-    // get the connection reference which can be kept by user as long as TcpShmClient is not destructed
-    Connection& GetConnection();
-```
+To implement a server, derive from `TcpShmServer<MyServer, Conf>` and define **public** callback methods:
 
-For receiving msgs and keeping the connection alive, user needs to frequenctly poll the client. For tcp mode user calls PollTcp(); For shm mode user calls both PollTcp() and PollShm(), from the same or different thread, using seperate thread has the advantage that app msg latency will be lower.
-
-```c++
-    // we need to PollTcp even if using shm
-    // now is a user provided timestamp, used to measure ConnectionTimeout and HeartBeatInverval
-    void PollTcp(int64_t now);
-
-    // only for using shm
-    void PollShm();
-```
-
-To stop the client, just call Stop()
-```c++
-    // stop the connection and close files
-    void Stop();
-```
-
-Also, user needs to define a collection of callback functions for framework to invoke:
-```c++
-    // called within Connect()
-    // reporting errors on connecting to the server
-    void OnSystemError(const char* error_msg, int sys_errno);
-
-    // called within Connect()
-    // Login rejected by server
-    void OnLoginReject(const LoginRspMsg* login_rsp);
-
-    // called within Connect()
-    // confirmation for login success
-    // return timestamp of now
-    int64_t OnLoginSuccess(const LoginRspMsg* login_rsp);
-
-    // called within Connect()
-    // server and client ptcp sequence number don't match, we need to fix it manually
-    void OnSeqNumberMismatch(uint32_t local_ack_seq,
-                             uint32_t local_seq_start,
-                             uint32_t local_seq_end,
-                             uint32_t remote_ack_seq,
-                             uint32_t remote_seq_start,
-                             uint32_t remote_seq_end);
-
-    // called by APP thread
-    // handle a new app msg from server
-    void OnServerMsg(MsgHeader* header);
-
-    // called by tcp thread
-    // connection is closed
-    void OnDisconnected(const char* reason, int sys_errno);
-```
-
-## Server Side
-tcpshm_server.h defines template Class `TcpShmServer`, same as `TcpShmClient`, user need to defines a new Class that derives from `TcpShmServer` and provides a configuration template class, and also a server name and ptcp folder name for TcpShmServer's constructor:
 ```c++
 #include "tcpshm/tcpshm_server.h"
 
-struct Conf
-{
-    // Connection related Conf:
-    ...
-
-    // Server related Conf:
-
-    // max number of unlogined tcp connection
-    static const uint32_t MaxNewConnections = 5;
-
-    // max number of shm connection per group
-    static const uint32_t MaxShmConnsPerGrp = 4;
-
-    // number of shm connection groups
-    static const uint32_t MaxShmGrps = 1;
-
-    // max number of tcp connections per group
-    static const uint32_t MaxTcpConnsPerGrp = 4;
-    
-    // number of tcp connection groups
-    static const uint32_t MaxTcpGrps = 1;
-
-    // unlogined tcp connection timeout, measured in user provided timestamp
-    static const int64_t NewConnectionTimeout = 3;
-};
-
-class MyServer;
-using TSServer = TcpShmServer<MyServer, Conf>;
-
-class MyServer : public TSServer
+class MyServer : public tcpshm::TcpShmServer<MyServer, Conf>
 {
 public:
     MyServer(const std::string& ptcp_dir, const std::string& name)
-        : TSServer(ptcp_dir, name) 
-...
+        : TcpShmServer(ptcp_dir, name) {}
+
+    // --- Public Callback Functions ---
+
+    void OnSystemError(const char* errno_msg, int sys_errno) {
+        std::cout << "System Error: " << errno_msg << std::endl;
+    }
+
+    int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* login_rsp) {
+        std::cout << "New Connection from: " << login->client_name << " use_shm=" << (bool)login->use_shm << std::endl;
+        // return assigned group ID (0 to MaxTcpGrps-1 or MaxShmGrps-1), or -1 to reject
+        return 0;
+    }
+
+    void OnClientLogon(const struct sockaddr_in& addr, Connection& conn) {
+        std::cout << "Client Logged on: " << conn.GetRemoteName() << std::endl;
+    }
+
+    void OnClientDisconnected(Connection& conn, const char* reason, int sys_errno) {
+        std::cout << "Client Disconnected: " << conn.GetRemoteName() << " reason: " << reason << std::endl;
+    }
+
+    void OnClientMsg(Connection& conn, MsgHeader* recv_header) {
+        // handle client message payload at recv_header + 1
+        conn.Pop();
+    }
+
+    void OnClientFileError(Connection& conn, const char* reason, int sys_errno) {
+        std::cout << "File error on " << conn.GetRemoteName() << ": " << reason << std::endl;
+    }
+
+    void OnSeqNumberMismatch(Connection& conn, uint32_t local_ack, uint32_t local_start, uint32_t local_end,
+                             uint32_t remote_ack, uint32_t remote_start, uint32_t remote_end) {}
+};
 ```
-User starts and stops the server by Start() and Stop():
+
+### Threading and Polling Model
+The server gives you complete control over threading and connection sharding. You can run one thread per group or poll everything from a single loop:
+
 ```c++
-    // start the server
-    // return true if success
-    bool Start(const char* listen_ipv4, uint16_t listen_port);
-    
-    void Stop();
+// Start listening on ip and port
+bool Start(const char* listen_ipv4, uint16_t listen_port);
+
+// Poll control: accepts new connections, performs SHM probe checks, and cleans up dead connections
+void PollCtl(int64_t now);
+
+// Poll specific TCP connection group
+void PollTcp(int64_t now, int grpid);
+
+// Poll specific SHM connection group
+void PollShm(int grpid);
+
+// Stop listening and release all connections
+void Stop();
 ```
 
-One important feature of the server is it allows user to customize their threading model. 
-The max number of threads it supports is MaxShmGrps + MaxTcpGrps + 1(for control thread), in this case, each group is served by a seperate thread.
-To the opposite extreme, user can have only one thread serving all.
-This logic is controlled by how user calls polling functions in his thread(s).
-Server has 3 polling functions, and they can be called from the same or different threads: 
-```c++
-    // poll control for handling new connections and keep shm connections alive
-    void PollCtl(int64_t now);
+---
 
-    // poll tcp for serving tcp connections
-    void PollTcp(int64_t now, int grpid);
+## SHM Handshake Probing Protocol (`use-shm` Probe)
 
-    // poll shm for serving shm connections
-    void PollShm(int grpid);
-```
+When `login->use_shm == 1`, `tcpshm` ensures that both processes reside on the same physical host and have valid read/write access to shared memory before opening the ring-buffer queues:
 
-Also, user needs to define a collection of callback functions for framework to invoke:
-```c++
-    // called with Start()
-    // reporting errors on Starting the server
-    void OnSystemError(const char* errno_msg, int sys_errno);
+1. **`LoginMsg` (`msg_type=1`)**: Client connects over TCP and requests `use_shm = 1`.
+2. **Token Generation & Probe Creation**: Server calls `VerifyShmProbe()`, generates `token = MakeShmProbeToken(client_name)`, and creates `/tcpshm_probe_<server>_<client>_<token>` (`sizeof(ShmProbeData)` bytes containing `token` and `ack=0`).
+3. **`ShmProbeReqMsg` (`msg_type=3`)**: Server sends probe request containing `token` and `/tcpshm_probe_...` filename via TCP.
+4. **Client Physical Memory Write**: Client receives `ShmProbeReqMsg`, opens the mmap file using `my_mmap_existing` (open-only, no create permission), verifies `probe->token == req->token`, calculates `ack = token ^ 0x5a5a5a5a5a5a5a5aULL`, and writes `ack` directly into `probe->ack` in shared memory.
+5. **`ShmProbeRspMsg` (`msg_type=4`)**: Client sends TCP response confirming `ack` and `ok=1`.
+6. **Server Final Verification**: Server receives `ShmProbeRspMsg`, checks `rsp->ok == 1` and `rsp->ack == token ^ 0x5a5a5a5a5a5a5a5aULL`, and reads physical shared memory `probe->ack` to ensure it matches. If verified, Server unlinks the probe file (`my_shm_unlink`) and grants login `LoginRspMsg (`status=0`)` with `use_shm=true`.
 
-    // called by CTL thread
-    // if accept the connection, set user_data in login_rsp and return grpid with respect to tcp or shm
-    // else set error_msg in login_rsp if possible, and return -1
-    // Note that even if we accept it here, there could be other errors on handling the login,
-    // so we have to wait OnClientLogon for confirmation
-    int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* login_rsp);
+---
 
-    // called by CTL thread
-    // ptcp or shm files can't be open or are corrupt
-    void OnClientFileError(Connection& conn, const char* reason, int sys_errno);
+## Cross-Platform Layer & Serialization Integration
 
-    // called by CTL thread
-    // server and client ptcp sequence number don't match, we need to fix it manually
-    void OnSeqNumberMismatch(Connection& conn,
-                             uint32_t local_ack_seq,
-                             uint32_t local_seq_start,
-                             uint32_t local_seq_end,
-                             uint32_t remote_ack_seq,
-                             uint32_t remote_seq_start,
-                             uint32_t remote_seq_end);
+### OS Abstraction (`os.h`)
+`tcpshm` includes a complete cross-platform OS layer `os.h` that masks platform differences:
+* On Windows, it handles `WSAStartup/WSACleanup` via `WSAInitializer`, manages file mappings (`CreateFileMappingA` / `OpenFileMappingA` / `MapViewOfFile`) using `MMapManager`, and simulates vector reads (`tcp_readv`) using `WSARecv`.
+* On Linux, it uses `shm_open / mmap / munmap`, `fcntl` non-blocking flags, and native `readv`.
 
-    // called by CTL thread
-    // confirmation for client logon
-    void OnClientLogon(const struct sockaddr_in& addr, Connection& conn);
-
-    // called by CTL thread
-    // client is disconnected
-    void OnClientDisconnected(Connection& conn, const char* reason, int sys_errno); 
-
-    // called by APP thread
-    void OnClientMsg(Connection& conn, MsgHeader* recv_header);
-```
+### Zero-Copy Protobuf / Struct Serialization
+Because `Alloc(size)` gives direct, 8-byte aligned access to the underlying memory queue (`header + 1`), you can serialize directly into the communication buffer without intermediate copies. See `server.cpp` / `client.cpp` for how modern C++ serialization (such as `iguana::to_pb` and `std::variant`) works with `tcpshm`.
