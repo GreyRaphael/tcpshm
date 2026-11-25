@@ -2,9 +2,9 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <exception>
 #include <iguana/iguana.hpp>
 #include <iostream>
-#include <print>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -47,7 +47,7 @@ static std::atomic<bool> stopped{false};
 
 class StringServer : public TSServer {
    public:
-    StringServer(const string& ptcp_dir, const string& name) : TSServer(ptcp_dir, name) {
+    StringServer(const string& name, const string& ptcp_dir) : TSServer(name, ptcp_dir) {
         signal(SIGTERM, StringServer::SignalHandler);
         signal(SIGINT, StringServer::SignalHandler);  // 补充支持 Ctrl+C
     }
@@ -76,15 +76,25 @@ class StringServer : public TSServer {
 
     // 核心逻辑：处理客户端发来的字符串并 Echo
     void OnClientMsg(Connection& conn, MsgHeader* recv_header) {
+        if (recv_header->size < sizeof(MsgHeader)) {
+            conn.Pop();
+            return;
+        }
         auto body_size = recv_header->size - sizeof(MsgHeader);
         std::string_view view{reinterpret_cast<char const*>(recv_header + 1), body_size};
         Request req{};
-        iguana::from_pb(req, view);
+        try {
+            iguana::from_pb(req, view);
+        } catch (const std::exception& e) {
+            cout << "Parse Request failed: " << e.what() << endl;
+            conn.Pop();
+            return;
+        }
         conn.Pop();
 
         std::visit(overload{
                        [&](Login& msg) {
-                           std::println("name={},pwd={}", msg.name, msg.password);
+                           cout << "name=" << msg.name << ",pwd=" << msg.password << endl;
                            if (msg.name == "gewei") {
                                auto login_rsp = Response{LoginResponse{0, "success"}};
                                writeResponse(conn, login_rsp);
@@ -93,7 +103,7 @@ class StringServer : public TSServer {
                                writeResponse(conn, login_rsp);
                            }
                        },
-                       [&](Order& msg) {},
+                       [&](Order&) {},
                        [&](auto const&) { /* 忽略 Login 或其他类型 */ }},
                    req.message_type);
     }
@@ -107,7 +117,8 @@ class StringServer : public TSServer {
     void writeResponse(Connection& conn, Response const& rsp) {
         std::string rsp_body{};
         iguana::to_pb(rsp, rsp_body);
-        auto rsp_header = conn.Alloc(rsp_body.size());
+        if (rsp_body.size() > 65535 - sizeof(MsgHeader)) return;
+        auto rsp_header = conn.Alloc(static_cast<uint16_t>(rsp_body.size()));
         if (!rsp_header) return;
         rsp_header->msg_type = 1;
         memcpy(rsp_header + 1, rsp_body.data(), rsp_body.size());
@@ -155,6 +166,6 @@ class StringServer : public TSServer {
 
 int main() {
     // 确保 server 目录存在，用于存放 ptcp 文件
-    StringServer server("server_ptcp", "server01");
+    StringServer server("server01", "server_ptcp");
     server.Run("127.0.0.1", 12345);
 }

@@ -1,7 +1,7 @@
 #include <chrono>
+#include <exception>
 #include <iguana/iguana.hpp>
 #include <iostream>
-#include <print>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -33,8 +33,8 @@ using TSClient = TcpShmClient<StringClient, ClientConf>;
 
 class StringClient : public TSClient {
    public:
-    StringClient(const string& ptcp_dir, const string& name)
-        : TSClient(ptcp_dir, name), conn(GetConnection()) {}
+    StringClient(const string& name, const string& ptcp_dir)
+        : TSClient(name, ptcp_dir), conn(GetConnection()) {}
 
     // --- 所有的回调函数现在都是 public，不再需要 friend 声明 ---
 
@@ -52,17 +52,25 @@ class StringClient : public TSClient {
     }
 
     void OnServerMsg(MsgHeader* header) {
+        if (header->size < sizeof(MsgHeader)) {
+            conn.Pop();
+            return;
+        }
         auto body_size = header->size - sizeof(MsgHeader);
         if (header->msg_type == 1) {
             auto view = std::string_view{reinterpret_cast<char const*>(header + 1), body_size};
             Response rsp{};
-            iguana::from_pb(rsp, view);
-            std::visit(overload{
-                           [&](LoginResponse& msg) {
-                               std::println("code={},msg={}", msg.error_code, msg.error_message);
-                           },
-                           [&](auto& msg) {}},
-                       rsp.message_type);
+            try {
+                iguana::from_pb(rsp, view);
+                std::visit(overload{
+                               [&](LoginResponse& msg) {
+                                   cout << "code=" << msg.error_code << ",msg=" << msg.error_message << endl;
+                               },
+                               [&](auto&) {}},
+                           rsp.message_type);
+            } catch (const std::exception& e) {
+                cout << "Parse Response failed: " << e.what() << endl;
+            }
         }
         conn.Pop();
     }
@@ -110,7 +118,11 @@ class StringClient : public TSClient {
         std::string out;
         iguana::to_pb(login_req, out);
 
-        auto header = conn.Alloc(out.size());
+        if (out.size() > 65535 - sizeof(MsgHeader)) {
+            cout << "Message too large!" << endl;
+            return;
+        }
+        auto header = conn.Alloc(static_cast<uint16_t>(out.size()));
         if (!header) {
             cout << "Send buffer full!" << endl;
             return;
@@ -129,7 +141,7 @@ int main(int argc, const char** argv) {
         std::cout << "usage: ./client name use_shm[0|1]\n";
         return -1;
     }
-    StringClient client(argv[1], argv[1]);
+    StringClient client(argv[1], "client_ptcp");
     bool use_shm = argv[2][0] != '0';
     client.Run("127.0.0.1", 12345, use_shm);
 }

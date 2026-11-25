@@ -24,10 +24,12 @@ SOFTWARE.
 
 #pragma once
 #include "endian.h"
+#include <cstdint>
+#include <type_traits>
 
 namespace tcpshm {
 
-struct MsgHeader
+struct alignas(8) MsgHeader
 {
     // size of this msg, including header itself
     // auto set by lib, can be read by user
@@ -39,11 +41,12 @@ struct MsgHeader
 
     template<bool ToLittle>
     void ConvertByteOrder() {
-        Endian<ToLittle> ed;
-        ed.ConvertInPlace(size);
-        ed.ConvertInPlace(msg_type);
-        ed.ConvertInPlace(ack_seq);
+        Endian<ToLittle>::ConvertInPlace(size);
+        Endian<ToLittle>::ConvertInPlace(msg_type);
+        Endian<ToLittle>::ConvertInPlace(ack_seq);
     }
 };
+
+static_assert(sizeof(MsgHeader) == 8 && alignof(MsgHeader) == 8 && std::is_trivially_copyable_v<MsgHeader>);
 } // namespace tcpshm
 

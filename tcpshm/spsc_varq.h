@@ -25,8 +25,12 @@ SOFTWARE.
 #pragma once
 #include "msg_header.h"
 #include "os.h"
-#include <bit>
 #include <atomic>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <new>
 
 namespace tcpshm {
 
@@ -34,84 +38,93 @@ template<uint32_t Bytes>
 class SPSCVarQueue
 {
 public:
-  static constexpr uint32_t BLK_CNT = Bytes / 64;
+  static constexpr uint32_t BLK_SZ = 64;
+  static constexpr uint32_t BLK_CNT = Bytes / BLK_SZ;
+  static_assert(Bytes % BLK_SZ == 0, "Bytes must be a multiple of 64");
   static_assert(BLK_CNT && std::has_single_bit(BLK_CNT), "BLK_CNT must be a power of 2");
+  static_assert(std::atomic<uint32_t>::is_always_lock_free, "std::atomic<uint32_t> must be lock-free");
 
   MsgHeader* Alloc(uint16_t size) {
-    size += sizeof(MsgHeader);
-    uint32_t blk_sz = (size + sizeof(Block) - 1) / sizeof(Block);
+    pending_blk_sz_ = 0;
+    if (size > 65535 - sizeof(MsgHeader)) return nullptr;
+    uint32_t total_size = static_cast<uint32_t>(size) + sizeof(MsgHeader);
+    uint32_t blk_sz = (total_size + BLK_SZ - 1) / BLK_SZ;
+    if (blk_sz > BLK_CNT) return nullptr;
     uint32_t local_write_idx = write_idx.load(std::memory_order_relaxed);
-    uint32_t padding_sz = BLK_CNT - (local_write_idx % BLK_CNT);
+    uint32_t padding_sz = BLK_CNT - (local_write_idx & (BLK_CNT - 1));
     bool rewind = blk_sz > padding_sz;
     // min_read_idx could be a negtive value which results in a large unsigned int
     uint32_t min_read_idx = local_write_idx + blk_sz + (rewind ? padding_sz : 0) - BLK_CNT;
-    if ((int)(read_idx_cach - min_read_idx) < 0) {
+    if (static_cast<int32_t>(read_idx_cach - min_read_idx) < 0) {
       read_idx_cach = read_idx.load(std::memory_order_acquire);
-      if ((int)(read_idx_cach - min_read_idx) < 0) { // no enough space
+      if (static_cast<int32_t>(read_idx_cach - min_read_idx) < 0) { // no enough space
         return nullptr;
       }
     }
     if (rewind) {
-      blk[local_write_idx % BLK_CNT].header.size = 0;
+      new (buf_ + static_cast<size_t>(local_write_idx & (BLK_CNT - 1)) * BLK_SZ) MsgHeader{0, 0, 0};
       local_write_idx += padding_sz;
-      write_idx.store(local_write_idx, std::memory_order_relaxed);
     }
-    MsgHeader& header = blk[local_write_idx % BLK_CNT].header;
-    header.size = size;
-    return &header;
-    }
+    MsgHeader* header =
+        new (buf_ + static_cast<size_t>(local_write_idx & (BLK_CNT - 1)) * BLK_SZ)
+            MsgHeader{static_cast<uint16_t>(total_size), 0, 0};
+    pending_write_idx_ = local_write_idx + blk_sz;
+    pending_blk_sz_ = blk_sz;
+    return header;
+  }
 
-    void Push() {
-        uint32_t local_write_idx = write_idx.load(std::memory_order_relaxed);
-        uint32_t blk_sz = (blk[local_write_idx % BLK_CNT].header.size + sizeof(Block) - 1) / sizeof(Block);
-        local_write_idx += blk_sz;
-        write_idx.store(local_write_idx, std::memory_order_release);
-        write_idx.notify_one();
-    }
+  void Push() {
+    if (pending_blk_sz_ == 0) return;
+    write_idx.store(pending_write_idx_, std::memory_order_release);
+    pending_blk_sz_ = 0;
+  }
 
-    MsgHeader* Front() {
-        uint32_t local_write_idx = write_idx.load(std::memory_order_acquire);
-        uint32_t local_read_idx = read_idx.load(std::memory_order_relaxed);
-        if(local_read_idx == local_write_idx) {
-            return nullptr;
-        }
-        uint16_t size = blk[local_read_idx % BLK_CNT].header.size;
-        if(size == 0) { // rewind
-            local_read_idx += BLK_CNT - (local_read_idx % BLK_CNT);
-            read_idx.store(local_read_idx, std::memory_order_relaxed);
-            if(local_read_idx == local_write_idx) {
-                return nullptr;
-            }
-        }
-        return &blk[local_read_idx % BLK_CNT].header;
+  MsgHeader* Front() {
+    uint32_t local_write_idx = write_idx.load(std::memory_order_acquire);
+    uint32_t local_read_idx = read_idx.load(std::memory_order_relaxed);
+    if (local_read_idx == local_write_idx) {
+      return nullptr;
     }
+    uint32_t slot = local_read_idx & (BLK_CNT - 1);
+    MsgHeader hdr;
+    std::memcpy(&hdr, buf_ + static_cast<size_t>(slot) * BLK_SZ, sizeof(MsgHeader));
+    if (hdr.size == 0) { // rewind
+      local_read_idx += BLK_CNT - slot;
+      read_idx.store(local_read_idx, std::memory_order_release);
+      if (local_read_idx == local_write_idx) {
+        return nullptr;
+      }
+      slot = local_read_idx & (BLK_CNT - 1);
+      std::memcpy(&hdr, buf_ + static_cast<size_t>(slot) * BLK_SZ, sizeof(MsgHeader));
+    }
+    if (hdr.size < sizeof(MsgHeader)) {
+      return nullptr;
+    }
+    uint32_t blk_sz = (static_cast<uint32_t>(hdr.size) + BLK_SZ - 1) / BLK_SZ;
+    uint32_t avail_blks = local_write_idx - local_read_idx;
+    if (blk_sz > avail_blks || blk_sz > BLK_CNT - slot) {
+      return nullptr;
+    }
+    front_blk_sz_ = blk_sz;
+    return std::launder(reinterpret_cast<MsgHeader*>(buf_ + static_cast<size_t>(slot) * BLK_SZ));
+  }
 
-    void Pop() {
-        uint32_t local_read_idx = read_idx.load(std::memory_order_relaxed);
-        uint32_t blk_sz = (blk[local_read_idx % BLK_CNT].header.size + sizeof(Block) - 1) / sizeof(Block);
-        local_read_idx += blk_sz;
-        read_idx.store(local_read_idx, std::memory_order_release);
-        read_idx.notify_one();
-    }
-
-    // C++20 efficient wait
-    void WaitForData() {
-        uint32_t curr_w = write_idx.load(std::memory_order_acquire);
-        while (curr_w == read_idx.load(std::memory_order_relaxed)) {
-            write_idx.wait(curr_w);
-            curr_w = write_idx.load(std::memory_order_acquire);
-        }
-    }
+  void Pop() {
+    if (front_blk_sz_ == 0) return;
+    uint32_t local_read_idx = read_idx.load(std::memory_order_relaxed);
+    read_idx.store(local_read_idx + front_blk_sz_, std::memory_order_release);
+    front_blk_sz_ = 0;
+  }
 
 private:
-  struct Block // size of 64, same as cache line
-  {
-    alignas(64) MsgHeader header;
-  } blk[BLK_CNT];
+  alignas(64) std::byte buf_[Bytes]{};
 
   alignas(128) std::atomic<uint32_t> write_idx{0};
   uint32_t read_idx_cach = 0; // used only by writing thread
+  uint32_t pending_write_idx_ = 0;
+  uint32_t pending_blk_sz_ = 0;
 
   alignas(128) std::atomic<uint32_t> read_idx{0};
+  uint32_t front_blk_sz_ = 0;
 };
 } // namespace tcpshm

@@ -44,7 +44,7 @@ protected:
         strncpy(client_name_, client_name.c_str(), sizeof(client_name_) - 1);
         tcp_mkdir(ptcp_dir_.c_str());
         client_name_[sizeof(client_name_) - 1] = 0;
-        conn_.init(ptcp_dir.c_str(), client_name_);
+        conn_.init(ptcp_dir_.c_str(), client_name_);
     }
 
     ~TcpShmClient() {

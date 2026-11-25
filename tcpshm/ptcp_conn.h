@@ -141,7 +141,7 @@ public:
     }
 
     void Reset() {
-        memset(q_, 0, sizeof(PTCPQ));
+        if(q_) q_->Reset();
     }
 
     void Release() {
@@ -202,15 +202,23 @@ public:
         if(int len = DoRecv()) {
             int old_writeidx = writeidx_;
             writeidx_ += len;
-            while(writeidx_ - nextmsg_idx_ >= 8) {
+            while(writeidx_ - nextmsg_idx_ >= sizeof(MsgHeader)) {
                 MsgHeader* header = (MsgHeader*)&recvbuf_[nextmsg_idx_];
-                if(old_writeidx - (int)nextmsg_idx_ < 8) { // we haven't converted this header
+                if(old_writeidx - (int)nextmsg_idx_ < (int)sizeof(MsgHeader)) { // we haven't converted this header
                     header->ConvertByteOrder<Conf::ToLittleEndian>();
                 }
-                q_->Ack(header->ack_seq);
-                int msg_size = (header->size + 7) & -8;
+                if(header->size < sizeof(MsgHeader) ||
+                   (header->msg_type == HeartbeatMsg::msg_type && header->size != sizeof(MsgHeader))) {
+                    Close("Invalid msg header", 0);
+                    return nullptr;
+                }
+                uint32_t msg_size = (static_cast<uint32_t>(header->size) + 7u) & ~7u;
                 if(msg_size > Conf::TcpRecvBufMaxSize) {
                     Close("Msg size larger than recv buf max size", 0);
+                    return nullptr;
+                }
+                if(!q_->Ack(header->ack_seq)) {
+                    Close("Invalid ack_seq", 0);
                     return nullptr;
                 }
                 if(writeidx_ - nextmsg_idx_ < msg_size) break;
@@ -230,7 +238,7 @@ public:
     // we have consumed the msg we got from Front()
     void Pop() {
         MsgHeader* header = (MsgHeader*)&recvbuf_[readidx_];
-        readidx_ += (header->size + 7) & -8;
+        readidx_ += (static_cast<uint32_t>(header->size) + 7u) & ~7u;
         q_->MyAck()++;
     }
 

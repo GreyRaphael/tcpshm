@@ -46,7 +46,7 @@ protected:
         server_name_[sizeof(server_name_) - 1] = 0;
         tcp_mkdir(ptcp_dir_.c_str());
         for(auto& conn : conn_pool_) {
-            conn.init(ptcp_dir.c_str(), server_name_);
+            conn.init(ptcp_dir_.c_str(), server_name_);
         }
         int cnt = 0;
         for(auto& grp : shm_grps_) {
