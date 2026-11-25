@@ -59,7 +59,7 @@ When a client connects and requests shared memory mode (`use_shm = 1`), `tcpshm`
   Downstream projects can link against `tcpshm::tcpshm` (which configures include paths, `cxx_std_20`, and platform libraries `Threads::Threads`, `rt` on Linux, and `ws2_32` on Windows) and include headers with `#include "tcpshm/..."`.
 
 ## Example
-  Check [`common.h`](common.h), [`server.cpp`](server.cpp), and [`client.cpp`](client.cpp) for a C++20 example demonstrating interactive client-server login/response communication over TCP or SHM, Protobuf serialization (`iguana`), `std::variant` dispatch, and single-polling-thread message submission.
+  Check [`common.h`](common.h), [`server.cpp`](server.cpp), and [`client.cpp`](client.cpp) for a C++20 example demonstrating interactive client-server login/response communication over TCP or SHM, Protobuf serialization (`iguana`), `std::variant` dispatch, and an explicit two-thread receive/send model separated into lock-free SHM (`RunShm`) and mutex-synchronized TCP (`RunTcp`) paths.
 
 ## Testing
   The repository includes a zero-external-dependency CTest regression suite in [`tests/tcpshm_test.cpp`](tests/tcpshm_test.cpp) covering `Alloc()` overflow bounds, `SPSCVarQueue` wrap-around and concurrent SPSC stress, `PTCPQueue::Ack()`/`SanityCheckAndGetSeq()` bounds, invalid framing handling, non-8-byte-aligned partial `EAGAIN` recovery, fragmented `LoginMsg` reception, TCP/SHM round-trip and reconnect recovery, and SHM probe/name validation:

@@ -1,13 +1,14 @@
-#include <atomic>
 #include <chrono>
-#include <deque>
+#include <cstring>
 #include <exception>
+#include <functional>
 #include <iguana/iguana.hpp>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <variant>
 
 #include "common.h"
@@ -42,15 +43,15 @@ class StringClient : public TSClient {
     // --- 所有的回调函数现在都是 public，不再需要 friend 声明 ---
 
     void OnSystemError(const char* error_msg, int /*sys_errno*/) {
-        cout << "System Error: " << error_msg << endl;
+        PrintLine("System Error: ", error_msg);
     }
 
     void OnLoginReject(const LoginRspMsg* login_rsp) {
-        cout << "Login Rejected: " << login_rsp->error_msg << endl;
+        PrintLine("Login Rejected: ", login_rsp->error_msg);
     }
 
     int64_t OnLoginSuccess(const LoginRspMsg* /*login_rsp*/) {
-        cout << "Login Success" << endl;
+        PrintLine("Login Success");
         return get_timestamp();  // 返回当前纳秒
     }
 
@@ -67,96 +68,138 @@ class StringClient : public TSClient {
                 iguana::from_pb(rsp, view);
                 std::visit(overload{
                                [&](LoginResponse& msg) {
-                                   cout << "code=" << msg.error_code << ",msg=" << msg.error_message << endl;
+                                   PrintLine("code=", msg.error_code, ",msg=", msg.error_message);
                                },
                                [&](auto&) {}},
                            rsp.message_type);
             } catch (const std::exception& e) {
-                cout << "Parse Response failed: " << e.what() << endl;
+                PrintLine("Parse Response failed: ", e.what());
             }
         }
         conn.Pop();
     }
 
     void OnDisconnected(const char* reason, int /*sys_errno*/) {
-        cout << "Disconnected: " << reason << endl;
+        PrintLine("Disconnected: ", reason);
     }
 
     void OnSeqNumberMismatch(uint32_t /*local_ack*/, uint32_t /*local_start*/, uint32_t /*local_end*/,
                              uint32_t /*remote_ack*/, uint32_t /*remote_start*/, uint32_t /*remote_end*/) {
-        cout << "Sequence mismatch detected." << endl;
+        PrintLine("Sequence mismatch detected.");
     }
 
-    // --- 业务逻辑 ---
+    // --- 业务逻辑：将 SHM（无锁）与 TCP（需互斥）两条链路拆分为独立双线程示例 ---
 
     void Run(const char* server_ip, uint16_t port, bool use_shm) {
         if (!Connect(use_shm, server_ip, port, 0)) return;
 
-        std::mutex tx_mtx;
-        std::deque<std::string> tx_queue;
-        std::atomic<bool> quit{false};
-
-        // 轮询线程：独占调用 Alloc/Push/Front/Pop/Close
-        thread poll_thr([this, use_shm, &tx_mtx, &tx_queue, &quit]() {
-            while (!conn.IsClosed()) {
-                if (use_shm) PollShm();
-                PollTcp(get_timestamp());
-                if (conn.IsClosed()) break;
-
-                std::deque<std::string> batch;
-                {
-                    std::lock_guard<std::mutex> lock(tx_mtx);
-                    batch.swap(tx_queue);
-                }
-                for (const auto& msg : batch) {
-                    Send(msg);
-                }
-                if (quit.load(std::memory_order_acquire)) {
-                    conn.Close();
-                    PollTcp(get_timestamp());
-                    break;
-                }
-                this_thread::sleep_for(chrono::microseconds(100));
-            }
-        });
-
-        cout << "Enter text to send (type 'exit' to stop):" << endl;
-        string input;
-        while (!conn.IsClosed()) {
-            cout << "> ";
-            if (!getline(cin, input) || input == "exit") break;
-            {
-                std::lock_guard<std::mutex> lock(tx_mtx);
-                tx_queue.push_back(std::move(input));
-            }
+        if (use_shm) {
+            RunShm();
+        } else {
+            RunTcp();
         }
-
-        quit.store(true, std::memory_order_release);
-        if (poll_thr.joinable()) poll_thr.join();
         Stop();
     }
 
    private:
+    // 1) SHM 链路：shm_sendq_ 与 shm_recvq_ 为两条独立的无锁 SPSC 队列，无需 tcp_mtx
+    void RunShm() {
+        std::thread shm_recv_thread(&StringClient::ShmRecvLoop, this);
+        std::thread shm_send_thread(&StringClient::ShmSendLoop, this);
+
+        shm_send_thread.join();
+        shm_recv_thread.join();
+    }
+
+    void ShmRecvLoop() {
+        while (!conn.IsClosed()) {
+            PollShm();
+            PollTcp(get_timestamp());  // SHM 模式下仅维持 TCP 心跳与断线检测，不碰 shm_sendq_
+            this_thread::sleep_for(chrono::microseconds(100));
+        }
+        // 连接关闭后补一次 PollTcp()，确保由本线程关闭 fd 并触发 OnDisconnected
+        PollTcp(get_timestamp());
+    }
+
+    void ShmSendLoop() {
+        RunInputLoop([this](const string& input) {
+            Send(input);  // 无锁并发：直接写入独立的 shm_sendq_
+        });
+    }
+
+    // 2) TCP 链路：PTCPConnection 收发共用 PTCPQueue/socket 状态，需用 tcp_mtx 串行保护 PollTcp 与 Send
+    void RunTcp() {
+        std::mutex tcp_mtx;
+        std::thread tcp_recv_thread(&StringClient::TcpRecvLoop, this, std::ref(tcp_mtx));
+        std::thread tcp_send_thread(&StringClient::TcpSendLoop, this, std::ref(tcp_mtx));
+
+        tcp_send_thread.join();
+        tcp_recv_thread.join();
+    }
+
+    void TcpRecvLoop(std::mutex& tcp_mtx) {
+        while (!conn.IsClosed()) {
+            {
+                std::lock_guard<std::mutex> lock(tcp_mtx);
+                PollTcp(get_timestamp());
+            }
+            this_thread::sleep_for(chrono::microseconds(100));
+        }
+        std::lock_guard<std::mutex> lock(tcp_mtx);
+        PollTcp(get_timestamp());
+    }
+
+    void TcpSendLoop(std::mutex& tcp_mtx) {
+        RunInputLoop([this, &tcp_mtx](const string& input) {
+            std::lock_guard<std::mutex> lock(tcp_mtx);
+            if (!conn.IsClosed()) Send(input);
+        });
+    }
+
+    template <typename SendFn>
+    void RunInputLoop(SendFn&& send_fn) {
+        PrintLine("Enter text to send (type 'exit' to stop):");
+        string input;
+        while (!conn.IsClosed()) {
+            PrintPrompt();
+            if (!getline(cin, input) || input == "exit") break;
+            if (!conn.IsClosed()) send_fn(input);
+        }
+        conn.Close();  // RequestClose() 本身原子线程安全，无需加锁
+    }
+
     void Send(const string& s) {
         auto login_req = Request{Login{s, "123456"}};
         std::string out;
         iguana::to_pb(login_req, out);
 
         if (out.size() > 65535 - sizeof(MsgHeader)) {
-            cout << "Message too large!" << endl;
+            PrintLine("Message too large!");
             return;
         }
         auto header = conn.Alloc(static_cast<uint16_t>(out.size()));
         if (!header) {
-            cout << "Send buffer full!" << endl;
+            PrintLine("Send buffer full!");
             return;
         }
         header->msg_type = 1;
-        memcpy(header + 1, out.data(), out.size());
+        std::memcpy(header + 1, out.data(), out.size());
 
         conn.Push();
     }
 
+    template <typename... Args>
+    void PrintLine(Args&&... args) {
+        std::lock_guard<std::mutex> lock(io_mtx_);
+        (cout << ... << std::forward<Args>(args)) << endl;
+    }
+
+    void PrintPrompt() {
+        std::lock_guard<std::mutex> lock(io_mtx_);
+        cout << "> " << flush;
+    }
+
+    std::mutex io_mtx_;
     Connection& conn;
 };
 

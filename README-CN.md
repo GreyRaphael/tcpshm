@@ -59,7 +59,7 @@ TCPSHM 采用纯头文件 (Header-only) 设计，提供了服务端与客户端 
   下游工程只需链接 `tcpshm::tcpshm`（自动配置头文件路径、`cxx_std_20` 以及跨平台系统库：Linux 下 `Threads::Threads` / `rt`，Windows 下 `ws2_32`），并以 `#include "tcpshm/..."` 引入即可。
 
 ## 代码示例 (Example)
-  请参考 [`common.h`](common.h)、[`server.cpp`](server.cpp) 与 [`client.cpp`](client.cpp)，这是一个完整的 C++20 示例，演示了基于 TCP/SHM 的交互式登录与应答通信、[iguana](https://github.com/qicosmos/iguana) Protobuf 序列化、`std::variant` 消息派发以及单轮询线程统一收发模型。
+  请参考 [`common.h`](common.h)、[`server.cpp`](server.cpp) 与 [`client.cpp`](client.cpp)，这是一个完整的 C++20 示例，演示了基于 TCP/SHM 的交互式登录与应答通信、[iguana](https://github.com/qicosmos/iguana) Protobuf 序列化、`std::variant` 消息派发以及分别针对 SHM 无锁链路与 TCP 加锁链路的显式双线程收发模型。
 
 ## 测试与回归验证 (Testing)
   仓库在 [`tests/tcpshm_test.cpp`](tests/tcpshm_test.cpp) 中内置了零第三方测试框架依赖的 CTest 回归测试集，覆盖 `Alloc()` 长度溢出拦截、`SPSCVarQueue` 环形回绕与并发 SPSC 压测、`PTCPQueue::Ack()` / `SanityCheckAndGetSeq()` 边界、畸形帧拒收、非 8 字节对齐部分发送 `EAGAIN` 恢复、`LoginMsg` 分片接收、TCP/SHM 往返与断线重连恢复以及 SHM 探针/非法名称校验：

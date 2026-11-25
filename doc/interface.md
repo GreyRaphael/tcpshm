@@ -206,7 +206,7 @@ public:
         if (!Connect(use_shm, server_ip, port, 0)) return;
 
         // poll in loop until connection closes
-        // if another thread needs to send or close, forward requests to this polling thread via a queue/atomic flag (see client.cpp)
+        // if sending from a separate thread in TCP mode, synchronize with PollTcp (SHM send/recv queues are lock-free and independent; see client.cpp)
         while (!conn_.IsClosed()) {
             if (use_shm) PollShm();
             PollTcp(get_timestamp());

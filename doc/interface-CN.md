@@ -206,7 +206,7 @@ public:
         if (!Connect(use_shm, server_ip, port, 0)) return;
 
         // 在连接未断开的生命周期中持续轮询收包
-        // 若需从其他线程发包或触发关闭，请通过队列与原子标志转发给本轮询线程执行（参见 client.cpp）
+        // 若需从独立发送线程写 TCP 连接，需与 PollTcp 互斥同步；SHM 模式收发队列相互独立可无锁并发（参见 client.cpp）
         while (!conn_.IsClosed()) {
             if (use_shm) PollShm();
             PollTcp(get_timestamp());
