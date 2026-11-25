@@ -302,6 +302,20 @@ inline uint64_t tcp_bswap64(uint64_t x) { return __builtin_bswap64(x); }
 // Synchronization primitives
 // ============================================================
 
+inline void tcp_copy_str(char* dst, size_t dst_sz, const char* src) {
+  if (dst_sz == 0) return;
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+  size_t len = 0;
+  while (len < dst_sz - 1 && src[len] != '\0') {
+    dst[len] = src[len];
+    ++len;
+  }
+  dst[len] = '\0';
+}
+
 inline void tcp_compiler_barrier() {
   std::atomic_signal_fence(std::memory_order_acq_rel);
 }
@@ -526,7 +540,7 @@ T* my_mmap_existing(const char* filename, bool use_shm, const char** error_msg) 
 }
 
 template<class T>
-void my_munmap(void* addr) {
+void my_munmap(T* addr) {
 #ifdef _WIN32
   if (addr) {
     UnmapViewOfFile(addr);
@@ -534,7 +548,7 @@ void my_munmap(void* addr) {
     if (h) CloseHandle(h);
   }
 #else
-  if (addr && addr != MAP_FAILED) {
+  if (addr && addr != reinterpret_cast<T*>(MAP_FAILED)) {
     munmap(addr, sizeof(T));
   }
 #endif

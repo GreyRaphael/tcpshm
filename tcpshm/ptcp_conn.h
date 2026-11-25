@@ -128,6 +128,15 @@ public:
         hbmsg_.ConvertByteOrder<Conf::ToLittleEndian>();
     }
 
+    ~PTCPConnection() {
+        Release();
+    }
+
+    PTCPConnection(const PTCPConnection&) = delete;
+    PTCPConnection& operator=(const PTCPConnection&) = delete;
+    PTCPConnection(PTCPConnection&&) = delete;
+    PTCPConnection& operator=(PTCPConnection&&) = delete;
+
     bool OpenFile(const char* ptcp_queue_file,
                   const char** error_msg) {
         if(!q_) {
@@ -218,11 +227,11 @@ public:
         }
 
         if(int len = DoRecv()) {
-            int old_writeidx = writeidx_;
-            writeidx_ += len;
+            uint32_t old_writeidx = writeidx_;
+            writeidx_ += static_cast<uint32_t>(len);
             while(writeidx_ - nextmsg_idx_ >= sizeof(MsgHeader)) {
                 MsgHeader* header = (MsgHeader*)&recvbuf_[nextmsg_idx_];
-                if(old_writeidx - (int)nextmsg_idx_ < (int)sizeof(MsgHeader)) { // we haven't converted this header
+                if(old_writeidx < nextmsg_idx_ + static_cast<uint32_t>(sizeof(MsgHeader))) { // we haven't converted this header
                     header->ConvertByteOrder<Conf::ToLittleEndian>();
                 }
                 if(header->size < sizeof(MsgHeader) ||
@@ -377,7 +386,7 @@ private:
         if(writable + extra_size == 0) return 0;
         int ret;
         if(extra_size == 0){
-            ret = tcp_recv(fd, &recvbuf_[writeidx_], writable, 0);
+            ret = tcp_recv(fd, &recvbuf_[writeidx_], static_cast<int>(writable), 0);
         }
         else {
             struct iovec vec[2];
@@ -405,20 +414,22 @@ private:
             return 0;
         }
         recv_time_ = now_;
-        if(ret <= (int)writable) return ret;
-        if(ret <= (int)(writable + readidx_)) { // need to memmove
+        if(ret <= static_cast<int>(writable)) return ret;
+        uint32_t uret = static_cast<uint32_t>(ret);
+        if(uret <= writable + readidx_) { // need to memmove
             memmove(&recvbuf_[0], &recvbuf_[readidx_], recvbuf_size_ - readidx_);
-            memcpy(&recvbuf_[recvbuf_size_ - readidx_], stackbuf, ret - writable);
+            memcpy(&recvbuf_[recvbuf_size_ - readidx_], stackbuf, uret - writable);
         }
         else { // need to expand buffer
             // newbufsize must be large enough to hold all data just read
             // and should be at least twice recvbuf_size_, but not larger than TcpRecvBufMaxSize
-            uint32_t newbufsize =
-                std::min(Conf::TcpRecvBufMaxSize, std::max(recvbuf_size_ * 2, (writeidx_ - readidx_ + ret + 7) & -8));
+            uint32_t newbufsize = std::min(
+                Conf::TcpRecvBufMaxSize,
+                std::max(recvbuf_size_ * 2, (writeidx_ - readidx_ + uret + 7u) & ~7u));
             // std::cout << "expand: " << recvbuf_size_ << " -> " << newbufsize << std::endl;
             std::unique_ptr<char[]> new_buf(new char[newbufsize]);
             memcpy(&new_buf[0], &recvbuf_[readidx_], recvbuf_size_ - readidx_);
-            memcpy(&new_buf[recvbuf_size_ - readidx_], stackbuf, ret - writable);
+            memcpy(&new_buf[recvbuf_size_ - readidx_], stackbuf, uret - writable);
             recvbuf_size_ = newbufsize;
             std::swap(recvbuf_, new_buf);
         }

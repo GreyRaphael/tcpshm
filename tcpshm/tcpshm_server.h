@@ -42,11 +42,15 @@ public:
     using LoginMsg = LoginMsgTpl<Conf>;
     using LoginRspMsg = LoginRspMsgTpl<Conf>;
 
+    TcpShmServer(const TcpShmServer&) = delete;
+    TcpShmServer& operator=(const TcpShmServer&) = delete;
+    TcpShmServer(TcpShmServer&&) = delete;
+    TcpShmServer& operator=(TcpShmServer&&) = delete;
+
 protected:
     TcpShmServer(const std::string& server_name, const std::string& ptcp_dir)
         : ptcp_dir_(ptcp_dir) {
-        strncpy(server_name_, server_name.c_str(), sizeof(server_name_) - 1);
-        server_name_[sizeof(server_name_) - 1] = 0;
+        tcp_copy_str(server_name_, sizeof(server_name_), server_name.c_str());
         tcp_mkdir(ptcp_dir_.c_str());
         for(auto& conn : conn_pool_) {
             conn.init(ptcp_dir_.c_str(), server_name_);
@@ -148,7 +152,7 @@ protected:
             }
         }
         // visit all new connections, trying to read LoginMsg
-        for(int i = 0; i < Conf::MaxNewConnections; i++) {
+        for(uint32_t i = 0; i < Conf::MaxNewConnections; i++) {
             NewConn& conn = new_conns_[i];
             if(conn.fd == INVALID_TCP_SOCKET) {
                 avail_idx_ = i;
@@ -307,7 +311,7 @@ protected:
         }
         tcp_close(listenfd_);
         listenfd_ = INVALID_TCP_SOCKET;
-        for(int i = 0; i < Conf::MaxNewConnections; i++) {
+        for(uint32_t i = 0; i < Conf::MaxNewConnections; i++) {
             tcp_socket_t& fd = new_conns_[i].fd;
             if(fd != INVALID_TCP_SOCKET) {
                 tcp_close(fd);
@@ -533,7 +537,7 @@ private:
         sendbuf[0].msg_type = LoginRspMsg::msg_type;
         sendbuf[0].ack_seq = 0;
         LoginRspMsg* login_rsp = (LoginRspMsg*)(sendbuf + 1);
-        strncpy(login_rsp->server_name, server_name_, sizeof(login_rsp->server_name) - 1);
+        tcp_copy_str(login_rsp->server_name, sizeof(login_rsp->server_name), server_name_);
         login_rsp->status = 2;
         login_rsp->error_msg[0] = 0;
 
@@ -542,7 +546,7 @@ private:
         login->last_server_name[sizeof(login->last_server_name) - 1] = 0;
         if(!IsValidClientName(login->client_name) ||
            strncmp(login->client_name, server_name_, sizeof(server_name_)) == 0) {
-            strncpy(login_rsp->error_msg, "Invalid client name", sizeof(login_rsp->error_msg) - 1);
+            tcp_copy_str(login_rsp->error_msg, sizeof(login_rsp->error_msg), "Invalid client name");
             SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
@@ -553,18 +557,18 @@ private:
         }
         if(grpid < 0 || static_cast<uint32_t>(grpid) >= max_grps) {
             if(login_rsp->error_msg[0] == 0) { // user didn't set error_msg? set a default one
-                strncpy(login_rsp->error_msg, grpid < 0 ? "Login Reject" : "Invalid group id", sizeof(login_rsp->error_msg) - 1);
+                tcp_copy_str(login_rsp->error_msg, sizeof(login_rsp->error_msg), grpid < 0 ? "Login Reject" : "Invalid group id");
             }
             SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
         if(IsClientNameLive(login->client_name)) {
-            strncpy(login_rsp->error_msg, "Already loggned on", sizeof(login_rsp->error_msg) - 1);
+            tcp_copy_str(login_rsp->error_msg, sizeof(login_rsp->error_msg), "Already loggned on");
             SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
         if(login->use_shm && !VerifyShmProbe(conn.fd, login->client_name)) {
-            strncpy(login_rsp->error_msg, "SHM probe failed", sizeof(login_rsp->error_msg) - 1);
+            tcp_copy_str(login_rsp->error_msg, sizeof(login_rsp->error_msg), "SHM probe failed");
             SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
@@ -579,15 +583,14 @@ private:
         }
         if(free_idx < 0) {
             // no space for new remote name
-            strncpy(login_rsp->error_msg, "Max client cnt exceeded", sizeof(login_rsp->error_msg) - 1);
+            tcp_copy_str(login_rsp->error_msg, sizeof(login_rsp->error_msg), "Max client cnt exceeded");
             SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
 
         Connection& curconn = *grp.conns[free_idx];
         char* remote_name = curconn.GetRemoteName();
-        strncpy(remote_name, login->client_name, Conf::NameSize - 1);
-        remote_name[Conf::NameSize - 1] = 0;
+        tcp_copy_str(remote_name, Conf::NameSize, login->client_name);
         auto rollback_conn = [&]() {
             remote_name[0] = '\0';
             curconn.Release();
@@ -598,7 +601,7 @@ private:
             // we can not mmap to ptcp or shm files with filenames related to local and remote name
             static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
             rollback_conn();
-            strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg) - 1);
+            tcp_copy_str(login_rsp->error_msg, sizeof(login_rsp->error_msg), "System error");
             SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
@@ -617,7 +620,7 @@ private:
             if(!curconn.GetSeq(&local_ack_seq, &local_seq_start, &local_seq_end, &error_msg)) {
                 static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
                 rollback_conn();
-                strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg) - 1);
+                tcp_copy_str(login_rsp->error_msg, sizeof(login_rsp->error_msg), "System error");
                 SendLoginRsp(conn.fd, sendbuf, login_rsp);
                 return;
             }
@@ -661,7 +664,7 @@ private:
 
     // check if seq_start <= ack_seq <= seq_end, considering uint32_t wrap around
     bool CheckAckInQueue(uint32_t ack_seq, uint32_t seq_start, uint32_t seq_end) {
-        return (int)(ack_seq - seq_start) >= 0 && (int)(seq_end - ack_seq) >= 0;
+        return static_cast<int32_t>(ack_seq - seq_start) >= 0 && static_cast<int32_t>(seq_end - ack_seq) >= 0;
     }
 
     static bool SendLoginRsp(tcp_socket_t fd, const MsgHeader* header, const LoginRspMsg* login_rsp) {
@@ -711,7 +714,7 @@ private:
         reqbuf[0].ack_seq = 0;
         ShmProbeReqMsg* req = (ShmProbeReqMsg*)(reqbuf + 1);
         req->token = token;
-        strncpy(req->shm_name, probe_name, sizeof(req->shm_name) - 1);
+        tcp_copy_str(req->shm_name, sizeof(req->shm_name), probe_name);
         reqbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
         req->template ConvertByteOrder<Conf::ToLittleEndian>();
         int sys_errno = 0;
@@ -751,7 +754,7 @@ private:
     tcp_socket_t listenfd_ = INVALID_TCP_SOCKET;
 
     NewConn new_conns_[Conf::MaxNewConnections];
-    int avail_idx_ = 0;
+    uint32_t avail_idx_ = 0;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> in_stop_{false};
     std::atomic<uint64_t> probe_seq_{1};

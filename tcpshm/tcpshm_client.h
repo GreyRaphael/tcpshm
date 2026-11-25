@@ -39,12 +39,16 @@ public:
     using LoginMsg = LoginMsgTpl<Conf>;
     using LoginRspMsg = LoginRspMsgTpl<Conf>;
 
+    TcpShmClient(const TcpShmClient&) = delete;
+    TcpShmClient& operator=(const TcpShmClient&) = delete;
+    TcpShmClient(TcpShmClient&&) = delete;
+    TcpShmClient& operator=(TcpShmClient&&) = delete;
+
 protected:
     TcpShmClient(const std::string& client_name, const std::string& ptcp_dir)
         : ptcp_dir_(ptcp_dir) {
-        strncpy(client_name_, client_name.c_str(), sizeof(client_name_) - 1);
+        tcp_copy_str(client_name_, sizeof(client_name_), client_name.c_str());
         tcp_mkdir(ptcp_dir_.c_str());
-        client_name_[sizeof(client_name_) - 1] = 0;
         conn_.init(ptcp_dir_.c_str(), client_name_);
     }
 
@@ -66,14 +70,13 @@ protected:
         const char* error_msg = nullptr;
         if(!server_name_) {
             std::string last_server_name_file = std::string(ptcp_dir_) + "/" + client_name_ + ".lastserver";
-            server_name_ = (char*)my_mmap<ServerName>(last_server_name_file.c_str(), false, &error_msg);
+            server_name_ = my_mmap<ServerName>(last_server_name_file.c_str(), false, &error_msg);
             if(!server_name_) {
                 static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
                 return false;
             }
         }
-        strncpy(conn_.GetRemoteName(), server_name_, sizeof(ServerName) - 1);
-        conn_.GetRemoteName()[sizeof(ServerName) - 1] = 0;
+        tcp_copy_str(conn_.GetRemoteName(), sizeof(ServerName), server_name_->data());
 
         tcp_socket_t fd = INVALID_TCP_SOCKET;
         auto cleanup_fail = [&]() {
@@ -90,19 +93,19 @@ protected:
         sendbuf[0].msg_type = LoginMsg::msg_type;
         sendbuf[0].ack_seq = 0;
         LoginMsg* login = (LoginMsg*)(sendbuf + 1);
-        strncpy(login->client_name, client_name_, sizeof(login->client_name) - 1);
-        strncpy(login->last_server_name, server_name_, sizeof(login->last_server_name) - 1);
+        tcp_copy_str(login->client_name, sizeof(login->client_name), client_name_);
+        tcp_copy_str(login->last_server_name, sizeof(login->last_server_name), server_name_->data());
         login->use_shm = use_shm;
         login->client_seq_start = login->client_seq_end = 0;
         login->user_data = login_user_data;
         bool opened_conn_file = false;
-        if(server_name_[0] && !use_shm &&
+        if((*server_name_)[0] && !use_shm &&
            (!conn_.OpenFile(use_shm, &error_msg) ||
             !conn_.GetSeq(&sendbuf[0].ack_seq, &login->client_seq_start, &login->client_seq_end, &error_msg))) {
             static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
             return cleanup_fail();
         }
-        opened_conn_file = server_name_[0] && !use_shm;
+        opened_conn_file = (*server_name_)[0] && !use_shm;
 
         struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
@@ -175,11 +178,10 @@ protected:
         }
         login_rsp->server_name[sizeof(login_rsp->server_name) - 1] = 0;
         // check if server name has changed
-        bool server_name_changed = strncmp(server_name_, login_rsp->server_name, sizeof(ServerName)) != 0;
+        bool server_name_changed = strncmp(server_name_->data(), login_rsp->server_name, sizeof(ServerName)) != 0;
         if(server_name_changed) {
             conn_.Release();
-            strncpy(conn_.GetRemoteName(), login_rsp->server_name, sizeof(ServerName) - 1);
-            conn_.GetRemoteName()[sizeof(ServerName) - 1] = 0;
+            tcp_copy_str(conn_.GetRemoteName(), sizeof(ServerName), login_rsp->server_name);
             opened_conn_file = false;
         }
         if(!opened_conn_file) {
@@ -192,8 +194,7 @@ protected:
             conn_.Reset();
         }
         if(server_name_changed) {
-            strncpy(server_name_, login_rsp->server_name, sizeof(ServerName) - 1);
-            server_name_[sizeof(ServerName) - 1] = 0;
+            tcp_copy_str(server_name_->data(), server_name_->size(), login_rsp->server_name);
         }
         tcp_set_nonblocking(fd);
         int64_t now = static_cast<Derived*>(this)->OnLoginSuccess(login_rsp);
@@ -351,9 +352,9 @@ private:
         return true;
     }
 
-    char client_name_[Conf::NameSize];
+    char client_name_[Conf::NameSize]{};
     using ServerName = std::array<char, Conf::NameSize>;
-    char* server_name_ = nullptr;
+    ServerName* server_name_ = nullptr;
     std::string ptcp_dir_;
     Connection conn_;
 };

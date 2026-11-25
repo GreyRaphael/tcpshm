@@ -56,21 +56,23 @@ class StringServer : public TSServer {
 
     // --- Public 回调函数，移除 friend 依赖 ---
 
-    void OnSystemError(const char* errno_msg, int sys_errno) {
+    void OnSystemError(const char* errno_msg, int /*sys_errno*/) {
         cout << "System Error: " << errno_msg << endl;
     }
 
-    int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* login_rsp) {
-        cout << "New Connection: " << login->client_name << " from " << inet_ntoa(addr.sin_addr) << ", use_shm=" << (bool)login->use_shm << endl;
+    int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* /*login_rsp*/) {
+        char ipbuf[INET_ADDRSTRLEN]{};
+        inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf));
+        cout << "New Connection: " << login->client_name << " from " << ipbuf << ", use_shm=" << static_cast<bool>(login->use_shm) << endl;
         // 简单映射到 group 0
         return 0;
     }
 
-    void OnClientLogon(const struct sockaddr_in& addr, Connection& conn) {
+    void OnClientLogon(const struct sockaddr_in& /*addr*/, Connection& conn) {
         cout << "Client Logged on: " << conn.GetRemoteName() << endl;
     }
 
-    void OnClientDisconnected(Connection& conn, const char* reason, int sys_errno) {
+    void OnClientDisconnected(Connection& conn, const char* reason, int /*sys_errno*/) {
         cout << "Client Disconnected: " << conn.GetRemoteName() << " Reason: " << reason << endl;
     }
 
@@ -109,10 +111,10 @@ class StringServer : public TSServer {
     }
 
     // 必要的空白回调
-    void OnClientFileError(Connection& conn, const char* r, int e) {
-        std::cout << "OnClientFileError" << e << "msg:" << r;
+    void OnClientFileError(Connection& /*conn*/, const char* r, int e) {
+        std::cout << "OnClientFileError" << e << "msg:" << r << std::endl;
     }
-    void OnSeqNumberMismatch(Connection& c, uint32_t a, uint32_t b, uint32_t d, uint32_t e, uint32_t f, uint32_t g) {}
+    void OnSeqNumberMismatch(Connection& /*c*/, uint32_t /*a*/, uint32_t /*b*/, uint32_t /*d*/, uint32_t /*e*/, uint32_t /*f*/, uint32_t /*g*/) {}
 
     void writeResponse(Connection& conn, Response const& rsp) {
         std::string rsp_body{};
@@ -131,20 +133,20 @@ class StringServer : public TSServer {
         vector<thread> threads;
         threads.reserve(ServerConf::MaxTcpGrps + ServerConf::MaxShmGrps);
         // TCP 轮询线程
-        for (int i = 0; i < ServerConf::MaxTcpGrps; ++i) {
-            threads.emplace_back([this, i]() {
+        for (uint32_t i = 0; i < ServerConf::MaxTcpGrps; ++i) {
+            threads.emplace_back([this, grpid = static_cast<int>(i)]() {
                 while (!stopped.load(std::memory_order_relaxed)) {
-                    PollTcp(get_timestamp(), i);
+                    PollTcp(get_timestamp(), grpid);
                     std::this_thread::yield();  // 比固定 sleep 更适合低延迟轮询
                 }
             });
         }
 
         // SHM 轮询线程
-        for (int i = 0; i < ServerConf::MaxShmGrps; ++i) {
-            threads.emplace_back([this, i]() {
+        for (uint32_t i = 0; i < ServerConf::MaxShmGrps; ++i) {
+            threads.emplace_back([this, grpid = static_cast<int>(i)]() {
                 while (!stopped.load(std::memory_order_relaxed)) {
-                    PollShm(i);
+                    PollShm(grpid);
                     std::this_thread::yield();
                 }
             });

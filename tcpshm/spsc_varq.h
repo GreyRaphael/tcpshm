@@ -40,14 +40,22 @@ class SPSCVarQueue
 public:
   static constexpr uint32_t BLK_SZ = 64;
   static constexpr uint32_t BLK_CNT = Bytes / BLK_SZ;
+  static constexpr uint32_t HDR_SZ = static_cast<uint32_t>(sizeof(MsgHeader));
   static_assert(Bytes % BLK_SZ == 0, "Bytes must be a multiple of 64");
   static_assert(BLK_CNT && std::has_single_bit(BLK_CNT), "BLK_CNT must be a power of 2");
   static_assert(std::atomic<uint32_t>::is_always_lock_free, "std::atomic<uint32_t> must be lock-free");
 
+  SPSCVarQueue() = default;
+  ~SPSCVarQueue() = default;
+  SPSCVarQueue(const SPSCVarQueue&) = delete;
+  SPSCVarQueue& operator=(const SPSCVarQueue&) = delete;
+  SPSCVarQueue(SPSCVarQueue&&) = delete;
+  SPSCVarQueue& operator=(SPSCVarQueue&&) = delete;
+
   MsgHeader* Alloc(uint16_t size) {
     pending_blk_sz_ = 0;
-    if (size > 65535 - sizeof(MsgHeader)) return nullptr;
-    uint32_t total_size = static_cast<uint32_t>(size) + sizeof(MsgHeader);
+    if (size > 65535u - HDR_SZ) return nullptr;
+    uint32_t total_size = static_cast<uint32_t>(size) + HDR_SZ;
     uint32_t blk_sz = (total_size + BLK_SZ - 1) / BLK_SZ;
     if (blk_sz > BLK_CNT) return nullptr;
     uint32_t local_write_idx = write_idx.load(std::memory_order_relaxed);

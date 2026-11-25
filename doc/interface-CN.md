@@ -1,21 +1,21 @@
 [English](interface.md) | [中文](interface-CN.md)
 
-tcpshm 接口与开发指南 (C++20/23)
+tcpshm 接口与开发指南 (C++20)
 ==============================
 
-`tcpshm` 是一个采用现代 C++（C++20/C++23）编写的高性能、面向连接的持久化消息队列通信框架，全面支持 **Linux 与 Windows** 跨平台部署。
+`tcpshm` 是一个采用现代 C++（**C++20**，兼容 C++23）编写的高性能、面向连接的持久化消息队列通信框架，全面支持 **Linux 与 Windows** 跨平台部署。
 
 ## MsgHeader 消息头部与保留消息类型
 
-无论控制消息还是业务应用消息，每一条在 `tcpshm` 中传输的消息包都会自动由框架在最前方附加一个 8 字节对齐的 `MsgHeader`（以当前主机的本地字节序存储）：
+无论控制消息还是业务应用消息，每一条在 `tcpshm` 中传输的消息包都会自动由框架在最前方附加一个 8 字节对齐 (`alignas(8)`) 的 `MsgHeader`（以当前主机的本地字节序存储）：
 
 ```c++
-struct MsgHeader
+struct alignas(8) MsgHeader
 {
     // 当前消息包的总字节大小（包含 MsgHeader 自身 8 字节在内，最大 65535）
     // 由底层 Alloc() 自动设置，应用端可直接读取
     uint16_t size;
-    // 业务层自定义的应用消息类型 ID（必须由用户在 Alloc() 后自行设置）
+    // 业务层自定义的应用消息类型 ID（必须由用户在 Alloc() 后自行设置，且严禁为 0）
     uint16_t msg_type;
     // 内部用于 PTCP 序列号与 ACK 对齐应答的字段，严禁业务层篡改
     uint32_t ack_seq;
@@ -29,7 +29,7 @@ struct MsgHeader
 
 ### 内部保留的 `msg_type` ID 说明
 在业务侧定义自己的协议消息 `msg_type` 时，请务必注意以下由框架内部保留或特定阶段占用的 ID：
-* `0`: `HeartbeatMsg`（底层心跳包，在连接空闲时用于双向探测与保活）。
+* `0`: `HeartbeatMsg`（底层心跳包，在连接空闲时用于双向探测与保活）。**业务应用消息严禁使用 `msg_type = 0`**，因为 `PTCPConnection::Front()` 会将 `msg_type == 0` 视作内部心跳包静默消费掉（若 `size != sizeof(MsgHeader)` 更会直接断开连接）。
 * `3`: `ShmProbeReqMsg`（SHM 握手探测请求包，由服务端发出以验证对共享内存的物理访问权限）。
 * `4`: `ShmProbeRspMsg`（SHM 握手探测响应包，由客户端验证成功后回发）。
 * `1` & `2`: `LoginMsg` (`msg_type=1`) 和 `LoginRspMsg` (`msg_type=2`)。仅在初次建立连接登录协商阶段被占用。**一旦登录握手成功完成（触发了 `OnLoginSuccess` / `OnClientLogon` 回调后），业务应用即可安全、自由地复用 `msg_type = 1` 与 `msg_type = 2` 作为普通业务消息 ID。**
@@ -46,13 +46,13 @@ struct MsgHeader
 要发送一条消息，首先通过调用 `Alloc()` 在发件队列中申请一段指定字节大小的内存空间：
 
 ```c++
-// 在发送缓冲区分配指定大小的消息空间 (传参 payload 大小即可，不必包含 MsgHeader 大小)
-// 返回的地址保证保证严格 8 字节对齐
-// 如果当前缓冲队列已满或剩余空间不足，将返回 nullptr
+// 在发送缓冲区分配指定大小的消息空间（传参 payload 大小即可，不含 MsgHeader；最大 65535 - sizeof(MsgHeader) = 65527 字节）
+// 返回的地址保证严格 8 字节对齐
+// 如果当前缓冲队列已满、剩余空间不足或 size > 65527，将返回 nullptr
 MsgHeader* Alloc(uint16_t size);
 ```
 
-在获取到返回的 `MsgHeader* header` 成功指针后，你需要在其上显式赋予 `header->msg_type` 业务类型，并将实际的业务负载（例如 C/C++ POD 结构体或序列化后的 Protobuf/JSON 字节流）精准拷贝进紧随头部之后的地址空间 (`header + 1`)。完成填充后，调用 `Push()` 或 `PushMore()` 提交并发往对端：
+在获取到返回的 `MsgHeader* header` 成功指针后，你需要在其上显式赋予非零的 `header->msg_type` 业务类型 (`msg_type != 0`)，并将实际的业务负载（例如 C/C++ POD 结构体或序列化后的 Protobuf/JSON 字节流）精准拷贝进紧随头部之后的地址空间 (`header + 1`)。完成填充后，调用 `Push()` 或 `PushMore()` 提交并发往对端：
 
 ```c++
 // 提交刚才 Alloc() 的最后一条消息并立刻触发发送处理
@@ -108,24 +108,24 @@ std::string GetPtcpFile();
 
 ## 全局配置模板类 (`Conf`)
 
-客户端与服务端均依赖一个静态配置类 (`Conf` 或继承自 `CommonConf`) 来定义会话命名限制、内存大小、延迟心跳及业务自定义关联字段：
+客户端与服务端均依赖一个静态配置类 (`Conf` 或继承自 `CommonConf`) 来定义会话命名限制、内存大小、延迟心跳、分片分组及业务自定义关联字段（下方标出的 6 个服务端专用配置项为 `TcpShmServer` 必需，纯客户端配置可按需省略）：
 
 ```c++
 struct Conf
 {
     // 会话名称最大字符数（包含结尾的 '\0'，默认为 16）
     static constexpr uint32_t NameSize = 16;
-    
-    // 共享内存环形队列缓冲区大小（单位字节，必须是 2 的幂次方，如 1MB）
+
+    // 共享内存环形队列缓冲区大小（单位字节，必须是 64 的倍数且 ShmQueueSize / 64 为 2 的幂次方，如 1MB）
     static constexpr uint32_t ShmQueueSize = 1024 * 1024;
 
     // 当前架构主导端大小端配置（对于 x86/x64 主机通常设为 true 即小端序）
-    static constexpr bool ToLittleEndian = true; 
+    static constexpr bool ToLittleEndian = true;
 
-    // TCP 发送队列缓冲空间大小（必须是 8 的倍数）
-    static constexpr uint32_t TcpQueueSize = 3000; 
+    // TCP 发送队列缓冲空间大小（必须是 8 的正整数倍）
+    static constexpr uint32_t TcpQueueSize = 3000;
 
-    // TCP 接收缓冲池的初始分配大小与最大动态扩容大小（必须是 8 的倍数）
+    // TCP 接收缓冲池的初始分配大小与最大动态扩容大小（必须是 8 的倍数且 TcpRecvBufMaxSize >= TcpRecvBufInitSize）
     static constexpr uint32_t TcpRecvBufInitSize = 1000;
     static constexpr uint32_t TcpRecvBufMaxSize = 2000;
 
@@ -133,6 +133,7 @@ struct Conf
     static constexpr bool TcpNoDelay = true;
 
     // 连接超时判断与心跳发包的时间间隔阈值（基于用户传入的时间戳单位，如纳秒）
+    // 注意：请保持字段原名 `HeartBeatInverval` 拼写不变
     static constexpr int64_t ConnectionTimeout = 10LL * 1000000000LL;
     static constexpr int64_t HeartBeatInverval = 3LL * 1000000000LL;
 
@@ -140,6 +141,18 @@ struct Conf
     using LoginUserData = char;
     using LoginRspUserData = char;
     using ConnectionUserData = char;
+
+    // --- 服务端专用配置项（TcpShmServer 必需） ---
+    // PollCtl 中同时允许处于登录握手阶段的最大未决连接数
+    static constexpr uint32_t MaxNewConnections = 5;
+    // 登录握手超时阈值（基于用户传入的时间戳单位，如纳秒）
+    static constexpr int64_t NewConnectionTimeout = 3LL * 1000000000LL;
+    // SHM 连接分组数量与每个 SHM 分组允许的最大连接数
+    static constexpr uint32_t MaxShmGrps = 1;
+    static constexpr uint32_t MaxShmConnsPerGrp = 4;
+    // TCP 连接分组数量与每个 TCP 分组允许的最大连接数
+    static constexpr uint32_t MaxTcpGrps = 1;
+    static constexpr uint32_t MaxTcpConnsPerGrp = 4;
 };
 ```
 
@@ -147,7 +160,7 @@ struct Conf
 
 ## 客户端开发指南 (`TcpShmClient`)
 
-要构建自定义客户端，继承自 `TcpShmClient<MyClient, Conf>` 并在你的类中直接定义**公开 (`public`)** 的回调处理函数：
+要构建自定义客户端，继承自 `TcpShmClient<MyClient, Conf>` 并在你的类中直接定义**公开 (`public`)** 的回调处理函数。注意构造函数参数顺序为 `(name, ptcp_dir)`，且 `client_name` 须为非空可打印 ASCII 字符，不可包含 `/`、`\`、`..` 且不得与 `server_name` 相同：
 
 ```c++
 #include "tcpshm/tcpshm_client.h"
@@ -155,8 +168,8 @@ struct Conf
 class MyClient : public tcpshm::TcpShmClient<MyClient, Conf>
 {
 public:
-    MyClient(const std::string& ptcp_dir, const std::string& name)
-        : TcpShmClient(ptcp_dir, name), conn_(GetConnection()) {}
+    MyClient(const std::string& name, const std::string& ptcp_dir)
+        : TcpShmClient(name, ptcp_dir), conn_(GetConnection()) {}
 
     // --- Public 业务与事件回调函数 ---
 
@@ -193,6 +206,7 @@ public:
         if (!Connect(use_shm, server_ip, port, 0)) return;
 
         // 在连接未断开的生命周期中持续轮询收包
+        // 若需从其他线程发包或触发关闭，请通过队列与原子标志转发给本轮询线程执行（参见 client.cpp）
         while (!conn_.IsClosed()) {
             if (use_shm) PollShm();
             PollTcp(get_timestamp());
@@ -217,7 +231,7 @@ private:
 
 ## 服务端开发指南 (`TcpShmServer`)
 
-要构建自定义服务端，继承自 `TcpShmServer<MyServer, Conf>` 并在派生类中定义**公开 (`public`)** 的回调处理函数：
+要构建自定义服务端，继承自 `TcpShmServer<MyServer, Conf>` 并在派生类中定义**公开 (`public`)** 的回调处理函数。注意构造函数参数顺序为 `(name, ptcp_dir)`：
 
 ```c++
 #include "tcpshm/tcpshm_server.h"
@@ -225,8 +239,8 @@ private:
 class MyServer : public tcpshm::TcpShmServer<MyServer, Conf>
 {
 public:
-    MyServer(const std::string& ptcp_dir, const std::string& name)
-        : TcpShmServer(ptcp_dir, name) {}
+    MyServer(const std::string& name, const std::string& ptcp_dir)
+        : TcpShmServer(name, ptcp_dir) {}
 
     // --- Public 业务与事件回调函数 ---
 
@@ -236,8 +250,8 @@ public:
 
     int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* login_rsp) {
         std::cout << "新连接请求: " << login->client_name << " 期望开启 SHM: " << (bool)login->use_shm << std::endl;
-        // 返回分配该客户端的目标线程分组 ID（范围为 0 到 MaxTcpGrps-1 或 MaxShmGrps-1）
-        // 如果想要拒绝该次登录请求，请返回 -1，并可在 login_rsp->error_msg 中设置拒绝说明
+        // 返回分配该客户端的目标线程分组 ID（use_shm 时为 0 到 MaxShmGrps-1，TCP 时为 0 到 MaxTcpGrps-1）
+        // 返回 -1 表示拒绝该次登录请求（越界分组 ID 同样会被拒绝），并可在 login_rsp->error_msg 中设置拒绝说明
         return 0;
     }
 
@@ -270,7 +284,7 @@ public:
 // 绑定 IP 和端口并启动监听
 bool Start(const char* listen_ipv4, uint16_t listen_port);
 
-// 主控制线程轮询：处理 accept 新连接、执行 SHM 探测握手验证并清理已死亡的残留连接
+// 主控制线程轮询：处理 accept 新连接、执行 SHM 探测握手验证并清理已退出的残留连接
 void PollCtl(int64_t now);
 
 // 业务线程轮询指定的 TCP 连接组 ID (0 <= grpid < MaxTcpGrps)
@@ -290,20 +304,20 @@ void Stop();
 当客户端 `login->use_shm == 1` 时，框架严密防范未授权或跨虚拟化的直接打开内存请求，其通信状态机规范如下：
 
 1. **`LoginMsg` 发送 (`msg_type=1`)**：客户端连接 TCP 并在登录包中带上 `use_shm = 1`。
-2. **随机 Token 生成与内存文件创建**：服务端执行 `VerifyShmProbe()`，生成一个包含自身物理指针与时间戳混淆的 64 位防冲突 Token `MakeShmProbeToken(client_name)`，接着在临时路径创建大小为 `sizeof(ShmProbeData)` 的探测映射文件 `/tcpshm_probe_<server>_<client>_<token>`，置入 `token` 及 `ack = 0`。
+2. **授权校验、随机 Token 生成与内存文件创建**：在 `OnNewConnection` 授权通过并校验在线客户端名称全局唯一后，服务端执行 `VerifyShmProbe()`，生成防冲突 64 位 Token `MakeShmProbeToken(client_name)` 与单调序号 `seq`，接着以独占模式创建大小为 `sizeof(ShmProbeData)` 的探测共享内存 `/tcpshm_probe_<token>_<seq>`，置入 `token` 及 `ack = 0`。
 3. **`ShmProbeReqMsg` 发出 (`msg_type=3`)**：服务端将带有探测内存名和 `token` 的请求经由 TCP 下发给客户端。
-4. **客户端物理内存映射回写**：客户端收到 `ShmProbeReqMsg` 后，必须严格使用**只读已存在模式 (`my_mmap_existing`)** 映射该共享内存。当核对物理内存里的 `probe->token == req->token` 成立时，客户端计算应答值 `ack = token ^ 0x5a5a5a5a5a5a5a5aULL`，并**直接将其写回物理内存地址处的 `probe->ack` 中**。
+4. **客户端物理内存映射回写**：客户端仅在 `use_shm == true` 且 `shm_name` 通过 `/tcpshm_probe_` 前缀与路径安全性校验时受理 `ShmProbeReqMsg`，随后严格使用**已存在读写模式（`my_mmap_existing`，可读写但严禁创建权限）**映射该共享内存。当核对物理内存里的 `probe->token == req->token` 成立时，客户端计算应答值 `ack = token ^ 0x5a5a5a5a5a5a5a5aULL`，并**直接将其写回物理共享内存地址处的 `probe->ack` 中**。
 5. **`ShmProbeRspMsg` 应答 (`msg_type=4`)**：客户端通过 TCP 回复应答包确认已经完成计算和回写 (`ok = 1`)。
-6. **服务端双重校验与放行**：服务端确认 TCP 包内 `rsp->ok == 1` 与 `rsp->ack` 匹配后，还要在**本地读取物理内存中的 `probe->ack`**。确认物理内存的的确确被对方改写成功后，服务端立即销毁并解绑探测文件 (`my_shm_unlink`)，随后发放 `LoginRspMsg (status=0)` 并为你正式分配对齐的超高速双向共享内存消息缓冲环。
+6. **服务端双重校验与放行**：服务端确认 TCP 包内 `rsp->ok` 与 `rsp->ack` 匹配后，还要在**本地读取物理内存中的 `probe->ack`**。确认物理内存的确被对方改写成功后，服务端立即销毁并解绑探测文件 (`my_shm_unlink`)，随后按需初始化/打开双向 `SPSCVarQueue` 共享内存缓冲环并发放 `LoginRspMsg (status=0)`。
 
 ---
 
 ## 跨平台操作底座与序列化对接
 
 ### OS 抽象层设计 (`os.h`)
-框架在 `os.h` 中针对跨操作系统网络编程和内存映射提供了零感知适配：
-* 在 Windows 上，封装 `WSAInitializer` 自理 `WSAStartup / WSACleanup`；利用 `MMapManager` 单例自动管理 `CreateFileMappingA` 与 `MapViewOfFile` 生成的 Mapping Handle 关闭引用链；将 Linux `readv` 优雅适配为了原生高效的 `WSARecv` 聚集读。
-* 在 Linux 上，原生采用 `shm_open / mmap / munmap` 内存映射，以及 `fcntl` 非阻塞设置和 `readv` 分散聚集 IO。
+框架在 `os.h` 中针对跨操作系统网络编程和内存映射提供了透明适配：
+* 在 Windows 上，通过 `ensure_wsa_initialized()` / `WSAInitializer` 自动完成 `WSAStartup / WSACleanup`；利用 `MMapManager` (`get_mmap_manager()`) 管理 `CreateFileMappingA` / `OpenFileMappingA` 与 `MapViewOfFile` 的 Mapping Handle 引用关闭链；将 Linux `readv` 适配为原生高效的 `WSARecv` 聚集读。
+* 在 Linux 上，原生采用 `shm_open`（`0600` 权限，探针额外使用 `O_EXCL`）/ `fstat` 尺寸校验 / `mmap` / `munmap` 内存映射，以及 `fcntl(F_GETFL/F_SETFL)` 非阻塞设置、`EINTR` 重试和 `readv` 分散聚集 IO。
 
-### 零拷贝现代序列化实战 (`Protobuf` & `std::variant`)
-由于 `conn.Alloc(size)` 直接给你分配了通信对齐缓冲环中 `header + 1` 位置的直写内存指针，开发者可跳过任何局部中间变量转储。例如借助现代 C++ 的 `iguana::to_pb` 直接把 Protobuf 格式序列化结果写进底层环形内存；在收包时通过 `std::string_view` 构建指向该共享缓冲区的零拷贝视图，并利用 `std::visit(overload{...})` 实现类型优雅派发。详细工程写法请参考项目的 `server.cpp` 与 `client.cpp`。
+### 零拷贝与现代序列化集成 (`Protobuf` & `std::variant`)
+由于 `conn.Alloc(size)` 直接返回通信对齐缓冲环中紧随 `MsgHeader` 之后 (`header + 1`) 的 8 字节对齐内存指针，固定大小结构体或已知长度的负载可直接原地写入以实现发送端零拷贝。若使用 `iguana::to_pb` 等变长 Protobuf 序列化库，`server.cpp` 与 `client.cpp` 会先序列化到 `std::string` 中间缓冲以获知准确字节长度，再调用 `Alloc(size)` + `memcpy` 写入环形队列；而在收包路径上，则直接通过 `std::string_view` 构建指向 `header + 1` 的零拷贝视图，并利用 `std::variant` + `overload` 实现类型优雅派发。

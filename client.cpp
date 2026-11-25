@@ -41,7 +41,7 @@ class StringClient : public TSClient {
 
     // --- 所有的回调函数现在都是 public，不再需要 friend 声明 ---
 
-    void OnSystemError(const char* error_msg, int sys_errno) {
+    void OnSystemError(const char* error_msg, int /*sys_errno*/) {
         cout << "System Error: " << error_msg << endl;
     }
 
@@ -49,7 +49,7 @@ class StringClient : public TSClient {
         cout << "Login Rejected: " << login_rsp->error_msg << endl;
     }
 
-    int64_t OnLoginSuccess(const LoginRspMsg* login_rsp) {
+    int64_t OnLoginSuccess(const LoginRspMsg* /*login_rsp*/) {
         cout << "Login Success" << endl;
         return get_timestamp();  // 返回当前纳秒
     }
@@ -78,12 +78,12 @@ class StringClient : public TSClient {
         conn.Pop();
     }
 
-    void OnDisconnected(const char* reason, int sys_errno) {
+    void OnDisconnected(const char* reason, int /*sys_errno*/) {
         cout << "Disconnected: " << reason << endl;
     }
 
-    void OnSeqNumberMismatch(uint32_t local_ack, uint32_t local_start, uint32_t local_end,
-                             uint32_t remote_ack, uint32_t remote_start, uint32_t remote_end) {
+    void OnSeqNumberMismatch(uint32_t /*local_ack*/, uint32_t /*local_start*/, uint32_t /*local_end*/,
+                             uint32_t /*remote_ack*/, uint32_t /*remote_start*/, uint32_t /*remote_end*/) {
         cout << "Sequence mismatch detected." << endl;
     }
 

@@ -15,7 +15,9 @@ struct CommonConf {
 
 // 必须用steady_clock, 否则windows timeout会有问题
 inline int64_t get_timestamp() {
-    return std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 // for variant dispatch

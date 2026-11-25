@@ -105,7 +105,12 @@ public:
             ptcp_conn_.Pop();
     }
 
-    typename Conf::ConnectionUserData user_data;
+    TcpShmConnection(const TcpShmConnection&) = delete;
+    TcpShmConnection& operator=(const TcpShmConnection&) = delete;
+    TcpShmConnection(TcpShmConnection&&) = delete;
+    TcpShmConnection& operator=(TcpShmConnection&&) = delete;
+
+    typename Conf::ConnectionUserData user_data{};
 
 private:
     template<class T1, class T2>
@@ -115,6 +120,10 @@ private:
 
     TcpShmConnection() {
         remote_name_[0] = 0;
+    }
+
+    ~TcpShmConnection() {
+        Release();
     }
 
     void init(const char* ptcp_dir, const char* local_name) {

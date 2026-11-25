@@ -37,9 +37,17 @@ template<uint32_t Bytes, bool ToLittleEndian>
 class PTCPQueue
 {
 public:
-    static_assert(Bytes > 0 && Bytes % sizeof(MsgHeader) == 0, "Bytes must be positive multiple of 8");
-    static constexpr uint32_t BLK_CNT = Bytes / sizeof(MsgHeader);
+    static constexpr uint32_t HDR_SZ = static_cast<uint32_t>(sizeof(MsgHeader));
+    static_assert(Bytes > 0 && Bytes % HDR_SZ == 0, "Bytes must be positive multiple of 8");
+    static constexpr uint32_t BLK_CNT = Bytes / HDR_SZ;
     static_assert(BLK_CNT <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "BLK_CNT exceeds int max");
+
+    PTCPQueue() = default;
+    ~PTCPQueue() = default;
+    PTCPQueue(const PTCPQueue&) = delete;
+    PTCPQueue& operator=(const PTCPQueue&) = delete;
+    PTCPQueue(PTCPQueue&&) = delete;
+    PTCPQueue& operator=(PTCPQueue&&) = delete;
 
     void Reset() {
         std::memset(buf_, 0, sizeof(buf_));
@@ -52,28 +60,28 @@ public:
     }
 
     MsgHeader* Alloc(uint16_t size) {
-        if(size > 65535 - sizeof(MsgHeader)) return nullptr;
-        uint32_t total_size = static_cast<uint32_t>(size) + sizeof(MsgHeader);
-        uint32_t blk_sz = (total_size + sizeof(MsgHeader) - 1) / sizeof(MsgHeader);
+        if(size > 65535u - HDR_SZ) return nullptr;
+        uint32_t total_size = static_cast<uint32_t>(size) + HDR_SZ;
+        uint32_t blk_sz = (total_size + HDR_SZ - 1) / HDR_SZ;
         if(blk_sz > BLK_CNT) return nullptr;
         uint32_t avail_sz = BLK_CNT - write_idx_;
         if(blk_sz > avail_sz) {
             if(blk_sz > avail_sz + read_idx_) return nullptr;
             std::memmove(buf_,
-                         buf_ + static_cast<size_t>(read_idx_) * sizeof(MsgHeader),
-                         static_cast<size_t>(write_idx_ - read_idx_) * sizeof(MsgHeader));
+                         buf_ + static_cast<size_t>(read_idx_) * HDR_SZ,
+                         static_cast<size_t>(write_idx_ - read_idx_) * HDR_SZ);
             write_idx_ -= read_idx_;
             send_idx_ -= read_idx_;
             read_idx_ = 0;
         }
-        MsgHeader* header = new (buf_ + static_cast<size_t>(write_idx_) * sizeof(MsgHeader)) MsgHeader;
+        MsgHeader* header = new (buf_ + static_cast<size_t>(write_idx_) * HDR_SZ) MsgHeader;
         header->size = static_cast<uint16_t>(total_size);
         return header;
     }
 
     void Push() {
         MsgHeader* header = BlkAt(write_idx_);
-        uint32_t blk_sz = (static_cast<uint32_t>(header->size) + sizeof(MsgHeader) - 1) / sizeof(MsgHeader);
+        uint32_t blk_sz = (static_cast<uint32_t>(header->size) + HDR_SZ - 1) / HDR_SZ;
         header->ack_seq = ack_seq_num_;
         header->ConvertByteOrder<ToLittleEndian>();
         write_idx_ += blk_sz;
@@ -107,10 +115,10 @@ public:
         while(seq != ack_seq) {
             if(idx >= write_idx_) return false;
             MsgHeader hdr;
-            std::memcpy(&hdr, buf_ + static_cast<size_t>(idx) * sizeof(MsgHeader), sizeof(MsgHeader));
+            std::memcpy(&hdr, buf_ + static_cast<size_t>(idx) * HDR_SZ, HDR_SZ);
             uint16_t msg_size = Endian<ToLittleEndian>::Convert(hdr.size);
-            if(msg_size < sizeof(MsgHeader)) return false;
-            uint32_t step = (static_cast<uint32_t>(msg_size) + sizeof(MsgHeader) - 1) / sizeof(MsgHeader);
+            if(msg_size < HDR_SZ) return false;
+            uint32_t step = (static_cast<uint32_t>(msg_size) + HDR_SZ - 1) / HDR_SZ;
             if(idx + step > write_idx_) return false;
             idx += step;
             seq++;
@@ -136,11 +144,11 @@ public:
         uint32_t idx = read_idx_;
         while(idx < write_idx_) {
             MsgHeader header;
-            std::memcpy(&header, buf_ + static_cast<size_t>(idx) * sizeof(MsgHeader), sizeof(MsgHeader));
+            std::memcpy(&header, buf_ + static_cast<size_t>(idx) * HDR_SZ, HDR_SZ);
             header.ConvertByteOrder<ToLittleEndian>();
-            if(header.size < sizeof(MsgHeader)) return false;
+            if(header.size < HDR_SZ) return false;
             if(static_cast<int32_t>(ack_seq_num_ - header.ack_seq) < 0) return false; // ack_seq in this msg is too new
-            uint32_t step = (static_cast<uint32_t>(header.size) + sizeof(MsgHeader) - 1) / sizeof(MsgHeader);
+            uint32_t step = (static_cast<uint32_t>(header.size) + HDR_SZ - 1) / HDR_SZ;
             if(idx + step > write_idx_) return false;
             idx += step;
             end++;
@@ -154,7 +162,7 @@ public:
 
 private:
     MsgHeader* BlkAt(uint32_t idx) {
-        return reinterpret_cast<MsgHeader*>(buf_ + static_cast<size_t>(idx) * sizeof(MsgHeader));
+        return reinterpret_cast<MsgHeader*>(buf_ + static_cast<size_t>(idx) * HDR_SZ);
     }
 
     alignas(64) std::byte buf_[Bytes]{};

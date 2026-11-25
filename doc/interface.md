@@ -3,19 +3,19 @@
 tcpshm Interface Documentation
 ==============================
 
-`tcpshm` is a high-performance, connection-oriented persistent message queue framework written in modern C++ (C++20/C++23) supporting both **Linux and Windows**.
+`tcpshm` is a high-performance, connection-oriented persistent message queue framework written in modern C++ (**C++20**, compatible with C++23) supporting both **Linux and Windows**.
 
 ## MsgHeader and Reserved Message Types
 
-Every message has an 8-byte `MsgHeader` automatically prepended, regardless of control message or application message, in host endianness:
+Every message has an 8-byte `alignas(8)` `MsgHeader` automatically prepended, regardless of control message or application message, in host endianness:
 
 ```c++
-struct MsgHeader
+struct alignas(8) MsgHeader
 {
     // size of this msg, including header itself (max 65535)
     // auto set by lib, can be read by user
     uint16_t size;
-    // msg type of app msg is set by user
+    // msg type of app msg is set by user and must not be 0
     uint16_t msg_type;
     // internally used for ptcp sequence and ack, must not be modified by user
     uint32_t ack_seq;
@@ -29,7 +29,7 @@ The framework automatically applies `std::endian`-based byte-order conversion on
 
 ### Reserved `msg_type` IDs
 When defining application messages, note the following internal reserved or special message types:
-* `0`: `HeartbeatMsg` (Internal heartbeat ping/pong sent during connection idle intervals).
+* `0`: `HeartbeatMsg` (Internal heartbeat ping/pong sent during connection idle intervals). **Application messages MUST NOT use `msg_type = 0`**, because `PTCPConnection::Front()` treats `msg_type == 0` as an internal heartbeat and silently consumes it (and closes the connection if `size != sizeof(MsgHeader)`).
 * `3`: `ShmProbeReqMsg` (Internal SHM probe request sent by server to verify physical shared memory accessibility).
 * `4`: `ShmProbeRspMsg` (Internal SHM probe response returned by client).
 * `1` & `2`: `LoginMsg` (`msg_type=1`) and `LoginRspMsg` (`msg_type=2`). These are used during the initial connection login phase. **Once the login handshake completes (`OnLoginSuccess` / `OnClientLogon`), application messages are free to reuse `msg_type = 1` and `msg_type = 2` safely.**
@@ -46,13 +46,13 @@ When defining application messages, note the following internal reserved or spec
 To send a message, allocate space in the send queue using `Alloc()`:
 
 ```c++
-// allocate a msg of specified size in send queue
+// allocate a msg of specified payload size in send queue (max payload size is 65535 - sizeof(MsgHeader) = 65527)
 // the returned address is guaranteed to be 8-byte aligned
-// return nullptr if buffer space is full
+// return nullptr if buffer space is full or size exceeds 65527
 MsgHeader* Alloc(uint16_t size);
 ```
 
-In the returned `MsgHeader` pointer, set the `msg_type` field and copy your message payload (e.g., C struct or serialized Protobuf bytes) immediately after the header (`header + 1`). Then call `Push()` or `PushMore()` to submit:
+In the returned `MsgHeader` pointer, set a non-zero `msg_type` field (`msg_type != 0`) and copy your message payload (e.g., C struct or serialized Protobuf bytes) immediately after the header (`header + 1`). Then call `Push()` or `PushMore()` to submit:
 
 ```c++
 // submit the last msg from Alloc() and send out immediately
@@ -108,24 +108,24 @@ In your application, you do not instantiate `TcpShmConnection` directly; instead
 
 ## Configuration (`Conf`)
 
-Both client and server rely on a `Conf` struct (or `CommonConf` base) to define sizes, timeouts, and custom data types:
+Both client and server rely on a `Conf` struct (or `CommonConf` base) to define sizes, timeouts, polling groups, and custom data types (the 6 server-only fields below are required by `TcpShmServer` and may be omitted for client-only configs):
 
 ```c++
 struct Conf
 {
     // the size of client/server name in chars, including ending null
     static constexpr uint32_t NameSize = 16;
-    
-    // shm ring-buffer queue size in bytes, must be a power of 2
+
+    // shm ring-buffer queue size in bytes (multiple of 64, with ShmQueueSize / 64 a power of 2, e.g. 1MB)
     static constexpr uint32_t ShmQueueSize = 1024 * 1024;
 
     // set to the endian of majority of the hosts (e.g. true for x86/x64)
-    static constexpr bool ToLittleEndian = true; 
+    static constexpr bool ToLittleEndian = true;
 
-    // tcp send queue size in bytes, must be a multiple of 8
-    static constexpr uint32_t TcpQueueSize = 3000; 
+    // tcp send queue size in bytes, must be a positive multiple of 8
+    static constexpr uint32_t TcpQueueSize = 3000;
 
-    // tcp recv buffer init and max sizes, must be multiples of 8
+    // tcp recv buffer init and max sizes, must be multiples of 8 (TcpRecvBufMaxSize >= TcpRecvBufInitSize)
     static constexpr uint32_t TcpRecvBufInitSize = 1000;
     static constexpr uint32_t TcpRecvBufMaxSize = 2000;
 
@@ -133,6 +133,7 @@ struct Conf
     static constexpr bool TcpNoDelay = true;
 
     // connection timeout and heartbeat interval, measured in user-provided timestamps (e.g. nanoseconds)
+    // note: keep the exact field name `HeartBeatInverval`
     static constexpr int64_t ConnectionTimeout = 10LL * 1000000000LL;
     static constexpr int64_t HeartBeatInverval = 3LL * 1000000000LL;
 
@@ -140,6 +141,18 @@ struct Conf
     using LoginUserData = char;
     using LoginRspUserData = char;
     using ConnectionUserData = char;
+
+    // --- Server-only configuration (required by TcpShmServer) ---
+    // max concurrent pending login connections in PollCtl
+    static constexpr uint32_t MaxNewConnections = 5;
+    // login handshake timeout in PollCtl, measured in user-provided timestamps
+    static constexpr int64_t NewConnectionTimeout = 3LL * 1000000000LL;
+    // number of SHM polling groups and max SHM connections per group
+    static constexpr uint32_t MaxShmGrps = 1;
+    static constexpr uint32_t MaxShmConnsPerGrp = 4;
+    // number of TCP polling groups and max TCP connections per group
+    static constexpr uint32_t MaxTcpGrps = 1;
+    static constexpr uint32_t MaxTcpConnsPerGrp = 4;
 };
 ```
 
@@ -147,7 +160,7 @@ struct Conf
 
 ## Client Side (`TcpShmClient`)
 
-To implement a client, derive from `TcpShmClient<MyClient, Conf>` and define **public** callback methods:
+To implement a client, derive from `TcpShmClient<MyClient, Conf>` and define **public** callback methods. Note the constructor argument order is `(name, ptcp_dir)`, and `client_name` must be non-empty printable ASCII without `/`, `\`, or `..` (and must differ from `server_name`):
 
 ```c++
 #include "tcpshm/tcpshm_client.h"
@@ -155,8 +168,8 @@ To implement a client, derive from `TcpShmClient<MyClient, Conf>` and define **p
 class MyClient : public tcpshm::TcpShmClient<MyClient, Conf>
 {
 public:
-    MyClient(const std::string& ptcp_dir, const std::string& name)
-        : TcpShmClient(ptcp_dir, name), conn_(GetConnection()) {}
+    MyClient(const std::string& name, const std::string& ptcp_dir)
+        : TcpShmClient(name, ptcp_dir), conn_(GetConnection()) {}
 
     // --- Public Callback Functions ---
 
@@ -193,6 +206,7 @@ public:
         if (!Connect(use_shm, server_ip, port, 0)) return;
 
         // poll in loop until connection closes
+        // if another thread needs to send or close, forward requests to this polling thread via a queue/atomic flag (see client.cpp)
         while (!conn_.IsClosed()) {
             if (use_shm) PollShm();
             PollTcp(get_timestamp());
@@ -217,7 +231,7 @@ private:
 
 ## Server Side (`TcpShmServer`)
 
-To implement a server, derive from `TcpShmServer<MyServer, Conf>` and define **public** callback methods:
+To implement a server, derive from `TcpShmServer<MyServer, Conf>` and define **public** callback methods. Note the constructor argument order is `(name, ptcp_dir)`:
 
 ```c++
 #include "tcpshm/tcpshm_server.h"
@@ -225,8 +239,8 @@ To implement a server, derive from `TcpShmServer<MyServer, Conf>` and define **p
 class MyServer : public tcpshm::TcpShmServer<MyServer, Conf>
 {
 public:
-    MyServer(const std::string& ptcp_dir, const std::string& name)
-        : TcpShmServer(ptcp_dir, name) {}
+    MyServer(const std::string& name, const std::string& ptcp_dir)
+        : TcpShmServer(name, ptcp_dir) {}
 
     // --- Public Callback Functions ---
 
@@ -236,7 +250,7 @@ public:
 
     int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* login_rsp) {
         std::cout << "New Connection from: " << login->client_name << " use_shm=" << (bool)login->use_shm << std::endl;
-        // return assigned group ID (0 to MaxTcpGrps-1 or MaxShmGrps-1), or -1 to reject
+        // return assigned group ID (0 to MaxShmGrps-1 for use_shm, or 0 to MaxTcpGrps-1 for TCP), or -1 to reject
         return 0;
     }
 
@@ -269,13 +283,13 @@ The server gives you complete control over threading and connection sharding. Yo
 // Start listening on ip and port
 bool Start(const char* listen_ipv4, uint16_t listen_port);
 
-// Poll control: accepts new connections, performs SHM probe checks, and cleans up dead connections
+// Poll control: accepts new connections, performs SHM probe checks, and cleans up retired connections
 void PollCtl(int64_t now);
 
-// Poll specific TCP connection group
+// Poll specific TCP connection group (0 <= grpid < MaxTcpGrps)
 void PollTcp(int64_t now, int grpid);
 
-// Poll specific SHM connection group
+// Poll specific SHM connection group (0 <= grpid < MaxShmGrps)
 void PollShm(int grpid);
 
 // Stop listening and release all connections
@@ -289,11 +303,11 @@ void Stop();
 When `login->use_shm == 1`, `tcpshm` ensures that both processes reside on the same physical host and have valid read/write access to shared memory before opening the ring-buffer queues:
 
 1. **`LoginMsg` (`msg_type=1`)**: Client connects over TCP and requests `use_shm = 1`.
-2. **Token Generation & Probe Creation**: Server calls `VerifyShmProbe()`, generates `token = MakeShmProbeToken(client_name)`, and creates `/tcpshm_probe_<server>_<client>_<token>` (`sizeof(ShmProbeData)` bytes containing `token` and `ack=0`).
+2. **Authorization, Token Generation & Probe Creation**: After `OnNewConnection` authorizes the connection and checks live-name uniqueness, Server calls `VerifyShmProbe()`, generates `token = MakeShmProbeToken(client_name)` and monotonic `seq`, and exclusively creates `/tcpshm_probe_<token>_<seq>` (`sizeof(ShmProbeData)` bytes containing `token` and `ack=0`).
 3. **`ShmProbeReqMsg` (`msg_type=3`)**: Server sends probe request containing `token` and `/tcpshm_probe_...` filename via TCP.
-4. **Client Physical Memory Write**: Client receives `ShmProbeReqMsg`, opens the mmap file using `my_mmap_existing` (open-only, no create permission), verifies `probe->token == req->token`, calculates `ack = token ^ 0x5a5a5a5a5a5a5a5aULL`, and writes `ack` directly into `probe->ack` in shared memory.
+4. **Client Physical Memory Write**: Client accepts `ShmProbeReqMsg` only when `use_shm == true` and `shm_name` passes `/tcpshm_probe_` validation, opens the mapping using `my_mmap_existing` (**open-existing read-write mode, strictly without create permission**), verifies `probe->token == req->token`, calculates `ack = token ^ 0x5a5a5a5a5a5a5a5aULL`, and writes `ack` directly into `probe->ack` in shared memory.
 5. **`ShmProbeRspMsg` (`msg_type=4`)**: Client sends TCP response confirming `ack` and `ok=1`.
-6. **Server Final Verification**: Server receives `ShmProbeRspMsg`, checks `rsp->ok == 1` and `rsp->ack == token ^ 0x5a5a5a5a5a5a5a5aULL`, and reads physical shared memory `probe->ack` to ensure it matches. If verified, Server unlinks the probe file (`my_shm_unlink`) and grants login `LoginRspMsg (`status=0`)` with `use_shm=true`.
+6. **Server Final Verification**: Server receives `ShmProbeRspMsg`, checks `rsp->ok` and `rsp->ack == token ^ 0x5a5a5a5a5a5a5a5aULL`, and reads physical shared memory `probe->ack` to ensure it matches. If verified, Server unlinks the probe file (`my_shm_unlink`), initializes/opens the bidirectional `SPSCVarQueue` ring buffers if needed, and grants login via `LoginRspMsg` (`status=0`).
 
 ---
 
@@ -301,8 +315,8 @@ When `login->use_shm == 1`, `tcpshm` ensures that both processes reside on the s
 
 ### OS Abstraction (`os.h`)
 `tcpshm` includes a complete cross-platform OS layer `os.h` that masks platform differences:
-* On Windows, it handles `WSAStartup/WSACleanup` via `WSAInitializer`, manages file mappings (`CreateFileMappingA` / `OpenFileMappingA` / `MapViewOfFile`) using `MMapManager`, and simulates vector reads (`tcp_readv`) using `WSARecv`.
-* On Linux, it uses `shm_open / mmap / munmap`, `fcntl` non-blocking flags, and native `readv`.
+* On Windows, it handles `WSAStartup/WSACleanup` via `ensure_wsa_initialized()` / `WSAInitializer`, manages file mappings (`CreateFileMappingA` / `OpenFileMappingA` / `MapViewOfFile`) using `MMapManager` (`get_mmap_manager()`), and simulates vector reads (`tcp_readv`) using `WSARecv`.
+* On Linux, it uses `shm_open` (`0600`, `O_EXCL` for probes) / `fstat` / `mmap` / `munmap`, `fcntl(F_GETFL/F_SETFL)` non-blocking flags, `EINTR` retries, and native `readv`.
 
-### Zero-Copy Protobuf / Struct Serialization
-Because `Alloc(size)` gives direct, 8-byte aligned access to the underlying memory queue (`header + 1`), you can serialize directly into the communication buffer without intermediate copies. See `server.cpp` / `client.cpp` for how modern C++ serialization (such as `iguana::to_pb` and `std::variant`) works with `tcpshm`.
+### Zero-Copy & Protobuf / Struct Serialization
+Because `Alloc(size)` returns an 8-byte aligned `MsgHeader*` directly inside the underlying queue buffer (`header + 1`), fixed-size C/C++ structs or known-size payloads can be constructed/written directly in place without intermediate copies. When using variable-length encoding such as Protobuf (`iguana::to_pb`), `server.cpp` and `client.cpp` serialize into a `std::string` buffer to determine the exact payload size before calling `Alloc(size)` + `memcpy`, while on the receive path they construct a zero-copy `std::string_view` over `header + 1` and dispatch with `std::variant` + `overload`.
