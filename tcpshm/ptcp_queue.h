@@ -85,6 +85,10 @@ public:
         return BlkAt(send_idx_);
     }
 
+    bool HasSendable() const {
+        return send_idx_ < write_idx_;
+    }
+
     void Sendout(int blk_sz) {
         send_idx_ += static_cast<uint32_t>(blk_sz);
     }

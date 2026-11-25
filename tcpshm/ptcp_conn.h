@@ -143,12 +143,14 @@ public:
     }
 
     void Reset() {
+        send_byte_off_ = 0;
         if(q_) q_->Reset();
     }
 
     void Release() {
         Close("Release", 0);
         TryCloseFd();
+        send_byte_off_ = 0;
         if(q_) {
             my_munmap<PTCPQ>(q_);
             q_ = nullptr;
@@ -159,6 +161,7 @@ public:
     void Open(tcp_socket_t sock_fd, uint32_t remote_ack_seq, int64_t now) {
         close_reason_ = "nil";
         close_errno_ = 0;
+        send_byte_off_ = 0;
         fd_to_close_ = sock_fd;
         sockfd_.store(sock_fd, std::memory_order_relaxed);
         close_claimed_.store(false, std::memory_order_release);
@@ -176,15 +179,18 @@ public:
     }
 
     MsgHeader* Alloc(uint16_t size) {
+        if(!q_) return nullptr;
         return q_->Alloc(size);
     }
 
     void Push() {
+        if(!q_) return;
         q_->Push();
         SendPending();
     }
 
     void PushMore() {
+        if(!q_) return;
         q_->Push();
     }
 
@@ -194,6 +200,10 @@ public:
         if(UseShm()) { // for shm, we only expect HB in tcp channel so just read something and ignore
             DoRecv();
             return nullptr;
+        }
+        if(q_ && (send_byte_off_ > 0 || q_->HasSendable())) {
+            SendPending();
+            if(IsClosed()) return nullptr;
         }
         while(nextmsg_idx_ != readidx_) {
             MsgHeader* header = (MsgHeader*)&recvbuf_[readidx_];
@@ -245,6 +255,7 @@ public:
 
     // we have consumed the msg we got from Front()
     void Pop() {
+        if(!q_ || readidx_ == nextmsg_idx_) return;
         MsgHeader* header = (MsgHeader*)&recvbuf_[readidx_];
         readidx_ += (static_cast<uint32_t>(header->size) + 7u) & ~7u;
         q_->MyAck()++;
@@ -255,13 +266,15 @@ public:
         tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
         if(fd == INVALID_TCP_SOCKET) return;
         now_ = now;
+        if(q_ && (send_byte_off_ > 0 || q_->HasSendable())) {
+            if(SendPending()) return;
+        }
         if(now_ - send_time_ < Conf::HeartBeatInverval) return;
         if(q_) {
-            if(SendPending()) return;
             hbmsg_.ack_seq = Endian<Conf::ToLittleEndian>::Convert(q_->MyAck());
         }
         int sent = tcp_send(fd, (const char*)&hbmsg_, sizeof(hbmsg_), TCP_MSG_NOSIGNAL);
-        if(sent < 0 && tcp_get_last_error() == TCP_ERR_AGAIN) return;
+        if(sent < 0 && tcp_is_retryable_err(tcp_get_last_error())) return;
         if(sent != (int)sizeof(MsgHeader)) { // for simplicity, we see partial sendout as error
             Close("Send error", sent < 0 ? tcp_get_last_error() : 0);
             return;
@@ -269,32 +282,43 @@ public:
         send_time_ = now_; // successfully sent
     }
 
-    // return false only if no pending data to send
+    // return false only if no pending data to send (or closed)
     bool SendPending() {
         tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
-        if(fd == INVALID_TCP_SOCKET) return false;
+        if(fd == INVALID_TCP_SOCKET || !q_) return false;
         int blk_sz;
-        const char* p = (char*)q_->GetSendable(blk_sz);
-        if(blk_sz == 0) return false;
-        uint32_t size = blk_sz << 3;
-        do {
-            int sent = tcp_send(fd, p, size, TCP_MSG_NOSIGNAL);
-            if(sent < 0) {
-                int err = tcp_get_last_error();
-                if(err != TCP_ERR_AGAIN || (size & 7)) {
-                    Close("Send error", err);
+        const char* base = reinterpret_cast<const char*>(q_->GetSendable(blk_sz));
+        if(blk_sz <= 0) {
+            send_byte_off_ = 0;
+            return false;
+        }
+        uint32_t total_bytes = (static_cast<uint32_t>(blk_sz) << 3) - send_byte_off_;
+        const char* p = base + send_byte_off_;
+        uint32_t sent_total = 0;
+        while(sent_total < total_bytes) {
+            int sent = tcp_send(fd, p + sent_total, static_cast<int>(total_bytes - sent_total), TCP_MSG_NOSIGNAL);
+            if(sent <= 0) {
+                if(sent == 0) {
+                    Close("Send error", 0);
                     return false;
                 }
-                else
+                int err = tcp_get_last_error();
+                if(tcp_is_retryable_err(err)) {
                     break;
+                }
+                Close("Send error", err);
+                return false;
             }
-            p += sent;
-            size -= sent;
-        } while(size > 0);
-        int sent_blk = blk_sz - (size >> 3);
-        if(sent_blk > 0) {
+            sent_total += static_cast<uint32_t>(sent);
+        }
+        if(sent_total > 0) {
             send_time_ = now_;
-            q_->Sendout(sent_blk);
+            uint32_t total_consumed = static_cast<uint32_t>(send_byte_off_) + sent_total;
+            uint32_t sent_blk = total_consumed >> 3;
+            send_byte_off_ = static_cast<uint8_t>(total_consumed & 7u);
+            if(sent_blk > 0) {
+                q_->Sendout(static_cast<int>(sent_blk));
+            }
         }
         return true;
     }
@@ -366,7 +390,7 @@ private:
         if(ret <= 0) {
             if(ret < 0) {
                 int err = tcp_get_last_error();
-                if(err == TCP_ERR_AGAIN) {
+                if(tcp_is_retryable_err(err)) {
                     if(now_ - recv_time_ > Conf::ConnectionTimeout) {
                         Close("Timeout", 0);
                     }
@@ -427,5 +451,6 @@ private:
     MsgHeader hbmsg_;
 
     uint32_t last_my_ack_ = 0;
+    uint8_t send_byte_off_ = 0;
 };
 } // namespace tcpshm

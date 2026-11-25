@@ -132,7 +132,21 @@ private:
             }
             if(!shm_recvq_) {
                 shm_recvq_ = my_mmap<SHMQ>(shm_recv_file.c_str(), true, error_msg);
-                if(!shm_recvq_) return false;
+                if(!shm_recvq_) {
+#ifdef _WIN32
+                    DWORD saved_err = GetLastError();
+#else
+                    int saved_errno = errno;
+#endif
+                    my_munmap<SHMQ>(shm_sendq_);
+                    shm_sendq_ = nullptr;
+#ifdef _WIN32
+                    SetLastError(saved_err);
+#else
+                    errno = saved_errno;
+#endif
+                    return false;
+                }
             }
             return true;
         }
@@ -173,7 +187,7 @@ private:
         ptcp_conn_.Release();
     }
 
-    void Open(int sock_fd, uint32_t remote_ack_seq, int64_t now) {
+    void Open(tcp_socket_t sock_fd, uint32_t remote_ack_seq, int64_t now) {
         ptcp_conn_.Open(sock_fd, remote_ack_seq, now);
     }
 
@@ -188,6 +202,7 @@ private:
     }
 
     MsgHeader* ShmFront() {
+        if(!shm_recvq_) return nullptr;
         return shm_recvq_->Front();
     }
 

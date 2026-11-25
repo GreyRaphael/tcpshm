@@ -63,7 +63,7 @@ protected:
             return false;
         }
         conn_.TryCloseFd();
-        const char* error_msg;
+        const char* error_msg = nullptr;
         if(!server_name_) {
             std::string last_server_name_file = std::string(ptcp_dir_) + "/" + client_name_ + ".lastserver";
             server_name_ = (char*)my_mmap<ServerName>(last_server_name_file.c_str(), false, &error_msg);
@@ -71,15 +71,27 @@ protected:
                 static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
                 return false;
             }
-            strncpy(conn_.GetRemoteName(), server_name_, sizeof(ServerName));
         }
-        MsgHeader sendbuf[1 + (sizeof(LoginMsg) + 7) / 8];
+        strncpy(conn_.GetRemoteName(), server_name_, sizeof(ServerName) - 1);
+        conn_.GetRemoteName()[sizeof(ServerName) - 1] = 0;
+
+        tcp_socket_t fd = INVALID_TCP_SOCKET;
+        auto cleanup_fail = [&]() {
+            if(fd != INVALID_TCP_SOCKET) {
+                tcp_close(fd);
+                fd = INVALID_TCP_SOCKET;
+            }
+            conn_.Release();
+            return false;
+        };
+
+        MsgHeader sendbuf[1 + (sizeof(LoginMsg) + 7) / 8]{};
         sendbuf[0].size = sizeof(MsgHeader) + sizeof(LoginMsg);
         sendbuf[0].msg_type = LoginMsg::msg_type;
         sendbuf[0].ack_seq = 0;
         LoginMsg* login = (LoginMsg*)(sendbuf + 1);
-        strncpy(login->client_name, client_name_, sizeof(login->client_name));
-        strncpy(login->last_server_name, server_name_, sizeof(login->last_server_name));
+        strncpy(login->client_name, client_name_, sizeof(login->client_name) - 1);
+        strncpy(login->last_server_name, server_name_, sizeof(login->last_server_name) - 1);
         login->use_shm = use_shm;
         login->client_seq_start = login->client_seq_end = 0;
         login->user_data = login_user_data;
@@ -88,42 +100,41 @@ protected:
            (!conn_.OpenFile(use_shm, &error_msg) ||
             !conn_.GetSeq(&sendbuf[0].ack_seq, &login->client_seq_start, &login->client_seq_end, &error_msg))) {
             static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
-            return false;
+            return cleanup_fail();
         }
         opened_conn_file = server_name_[0] && !use_shm;
-        tcp_socket_t fd;
-        if((fd = tcp_socket(AF_INET, SOCK_STREAM, 0)) == INVALID_TCP_SOCKET) {
-            static_cast<Derived*>(this)->OnSystemError("socket", tcp_get_last_error());
-            return false;
-        }
-        if(tcp_set_timeout(fd, SOL_SOCKET, SO_RCVTIMEO, 10000) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("tcp_set_timeout SO_RCVTIMEO", tcp_get_last_error());
-            tcp_close(fd);
-            return false;
-        }
-
-        if(tcp_set_timeout(fd, SOL_SOCKET, SO_SNDTIMEO, 10000) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("tcp_set_timeout SO_SNDTIMEO", tcp_get_last_error());
-            tcp_close(fd);
-            return false;
-        }
-        int yes = 1;
-        if(Conf::TcpNoDelay && tcp_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&yes, sizeof(yes)) < 0) {
-            static_cast<Derived*>(this)->OnSystemError("setsockopt TCP_NODELAY", tcp_get_last_error());
-            tcp_close(fd);
-            return false;
-        }
 
         struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
-        inet_pton(AF_INET, server_ipv4, &(server_addr.sin_addr));
+        if(inet_pton(AF_INET, server_ipv4, &(server_addr.sin_addr)) != 1) {
+            static_cast<Derived*>(this)->OnSystemError("inet_pton", tcp_get_last_error());
+            return cleanup_fail();
+        }
         server_addr.sin_port = htons(server_port);
+
+        if((fd = tcp_socket(AF_INET, SOCK_STREAM, 0)) == INVALID_TCP_SOCKET) {
+            static_cast<Derived*>(this)->OnSystemError("socket", tcp_get_last_error());
+            return cleanup_fail();
+        }
+        if(tcp_set_timeout(fd, SOL_SOCKET, SO_RCVTIMEO, 10000) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("tcp_set_timeout SO_RCVTIMEO", tcp_get_last_error());
+            return cleanup_fail();
+        }
+
+        if(tcp_set_timeout(fd, SOL_SOCKET, SO_SNDTIMEO, 10000) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("tcp_set_timeout SO_SNDTIMEO", tcp_get_last_error());
+            return cleanup_fail();
+        }
+        int yes = 1;
+        if(Conf::TcpNoDelay && tcp_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&yes, sizeof(yes)) < 0) {
+            static_cast<Derived*>(this)->OnSystemError("setsockopt TCP_NODELAY", tcp_get_last_error());
+            return cleanup_fail();
+        }
 
         if(tcp_connect(fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             static_cast<Derived*>(this)->OnSystemError("connect", tcp_get_last_error());
-            tcp_close(fd);
-            return false;
+            return cleanup_fail();
         }
 
         sendbuf[0].template ConvertByteOrder<Conf::ToLittleEndian>();
@@ -131,23 +142,20 @@ protected:
         int sys_errno = 0;
         if(!tcp_send_all(fd, sendbuf, sizeof(sendbuf), TCP_MSG_NOSIGNAL, &sys_errno)) {
             static_cast<Derived*>(this)->OnSystemError("send", sys_errno);
-            tcp_close(fd);
-            return false;
+            return cleanup_fail();
         }
 
-        MsgHeader recvbuf[1 + (sizeof(LoginRspMsg) + 7) / 8];
+        MsgHeader recvbuf[1 + (sizeof(LoginRspMsg) + 7) / 8]{};
         const char* recv_error = nullptr;
-        if(!RecvLoginRsp(fd, recvbuf, &recv_error, &sys_errno)) {
+        if(!RecvLoginRsp(fd, use_shm, recvbuf, &recv_error, &sys_errno)) {
             static_cast<Derived*>(this)->OnSystemError(recv_error, sys_errno);
-            tcp_close(fd);
-            return false;
+            return cleanup_fail();
         }
         LoginRspMsg* login_rsp = (LoginRspMsg*)(recvbuf + 1);
         if(recvbuf[0].size != sizeof(MsgHeader) + sizeof(LoginRspMsg) || recvbuf[0].msg_type != LoginRspMsg::msg_type ||
            login_rsp->server_name[0] == 0) {
             static_cast<Derived*>(this)->OnSystemError("Invalid LoginRsp", 0);
-            tcp_close(fd);
-            return false;
+            return cleanup_fail();
         }
         if(login_rsp->status != 0) {
             if(login_rsp->status == 1) { // seq number mismatch
@@ -163,27 +171,29 @@ protected:
             else {
                 static_cast<Derived*>(this)->OnLoginReject(login_rsp);
             }
-            tcp_close(fd);
-            return false;
+            return cleanup_fail();
         }
         login_rsp->server_name[sizeof(login_rsp->server_name) - 1] = 0;
         // check if server name has changed
         bool server_name_changed = strncmp(server_name_, login_rsp->server_name, sizeof(ServerName)) != 0;
         if(server_name_changed) {
             conn_.Release();
-            strncpy(server_name_, login_rsp->server_name, sizeof(ServerName));
-            strncpy(conn_.GetRemoteName(), server_name_, sizeof(ServerName));
+            strncpy(conn_.GetRemoteName(), login_rsp->server_name, sizeof(ServerName) - 1);
+            conn_.GetRemoteName()[sizeof(ServerName) - 1] = 0;
             opened_conn_file = false;
         }
         if(!opened_conn_file) {
             if(!conn_.OpenFile(use_shm, &error_msg)) {
                 static_cast<Derived*>(this)->OnSystemError(error_msg, tcp_get_last_error());
-                tcp_close(fd);
-                return false;
+                return cleanup_fail();
             }
         }
         if(server_name_changed && !use_shm) {
             conn_.Reset();
+        }
+        if(server_name_changed) {
+            strncpy(server_name_, login_rsp->server_name, sizeof(ServerName) - 1);
+            server_name_[sizeof(ServerName) - 1] = 0;
         }
         tcp_set_nonblocking(fd);
         int64_t now = static_cast<Derived*>(this)->OnLoginSuccess(login_rsp);
@@ -227,6 +237,7 @@ protected:
 
 private:
     static bool RecvLoginRsp(tcp_socket_t fd,
+                             bool use_shm,
                              MsgHeader* recvbuf,
                              const char** error_msg,
                              int* sys_errno) {
@@ -234,6 +245,11 @@ private:
         if(!RecvHeader(fd, &header, error_msg, sys_errno)) return false;
 
         if(header.msg_type == ShmProbeReqMsg::msg_type) {
+            if(!use_shm) {
+                *error_msg = "Unexpected ShmProbeReq";
+                if(sys_errno) *sys_errno = 0;
+                return false;
+            }
             if(!HandleShmProbe(fd, header, error_msg, sys_errno)) return false;
             if(!RecvHeader(fd, &header, error_msg, sys_errno)) return false;
         }
@@ -253,6 +269,8 @@ private:
         }
         LoginRspMsg* login_rsp = (LoginRspMsg*)(recvbuf + 1);
         login_rsp->ConvertByteOrder();
+        login_rsp->server_name[sizeof(login_rsp->server_name) - 1] = 0;
+        login_rsp->error_msg[sizeof(login_rsp->error_msg) - 1] = 0;
         return true;
     }
 
@@ -268,6 +286,18 @@ private:
         return true;
     }
 
+    static bool IsValidShmProbeName(const char* name) {
+        constexpr char prefix[] = "/tcpshm_probe_";
+        constexpr size_t prefix_len = sizeof(prefix) - 1;
+        if(strncmp(name, prefix, prefix_len) != 0) return false;
+        if(strstr(name, "..") != nullptr) return false;
+        for(const char* p = name + 1; *p; ++p) {
+            unsigned char c = static_cast<unsigned char>(*p);
+            if(c == '/' || c == '\\' || c < 0x20 || c >= 0x7f) return false;
+        }
+        return true;
+    }
+
     static bool HandleShmProbe(tcp_socket_t fd,
                                const MsgHeader& header,
                                const char** error_msg,
@@ -278,7 +308,7 @@ private:
             return false;
         }
 
-        MsgHeader probebuf[1 + (sizeof(ShmProbeReqMsg) + 7) / 8];
+        MsgHeader probebuf[1 + (sizeof(ShmProbeReqMsg) + 7) / 8]{};
         probebuf[0] = header;
         constexpr int ProbeBodyBufSize = ((sizeof(ShmProbeReqMsg) + 7) / 8) * 8;
         if(!tcp_recv_all(fd, probebuf + 1, ProbeBodyBufSize, sys_errno)) {
@@ -292,15 +322,17 @@ private:
 
         uint64_t ack = 0;
         char ok = 0;
-        const char* mmap_error = nullptr;
-        ShmProbeData* probe = my_mmap_existing<ShmProbeData>(req->shm_name, true, &mmap_error);
-        if(probe) {
-            if(std::atomic_ref<uint64_t>(probe->token).load(std::memory_order_acquire) == req->token) {
-                ack = req->token ^ ShmProbeAckMask;
-                std::atomic_ref<uint64_t>(probe->ack).store(ack, std::memory_order_release);
-                ok = 1;
+        if(IsValidShmProbeName(req->shm_name)) {
+            const char* mmap_error = nullptr;
+            ShmProbeData* probe = my_mmap_existing<ShmProbeData>(req->shm_name, true, &mmap_error);
+            if(probe) {
+                if(std::atomic_ref<uint64_t>(probe->token).load(std::memory_order_acquire) == req->token) {
+                    ack = req->token ^ ShmProbeAckMask;
+                    std::atomic_ref<uint64_t>(probe->ack).store(ack, std::memory_order_release);
+                    ok = 1;
+                }
+                my_munmap<ShmProbeData>(probe);
             }
-            my_munmap<ShmProbeData>(probe);
         }
 
         MsgHeader rspbuf[1 + (sizeof(ShmProbeRspMsg) + 7) / 8]{};

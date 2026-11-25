@@ -25,6 +25,8 @@ SOFTWARE.
 #pragma once
 #include "os.h"
 #include <bit>
+#include <cstdint>
+#include <type_traits>
 
 namespace tcpshm {
 
@@ -32,20 +34,23 @@ template<bool ToLittle>
 class Endian
 {
 public:
+    static_assert(std::endian::native == std::endian::little ||
+                  std::endian::native == std::endian::big,
+                  "Mixed-endian platforms are not supported");
     static constexpr bool IsLittle = std::endian::native == std::endian::little;
 
     template<class T>
     static T Convert(T t) {
-        if constexpr (ToLittle == IsLittle) return t;
-
-        if constexpr (sizeof(T) == 2)
-            return tcp_bswap16((uint16_t)t);
+        static_assert(std::is_trivially_copyable_v<T>, "Endian::Convert requires trivially copyable type");
+        if constexpr (ToLittle == IsLittle || sizeof(T) == 1) return t;
+        else if constexpr (sizeof(T) == 2)
+            return std::bit_cast<T>(tcp_bswap16(std::bit_cast<uint16_t>(t)));
         else if constexpr (sizeof(T) == 4)
-            return tcp_bswap32((uint32_t)t);
+            return std::bit_cast<T>(tcp_bswap32(std::bit_cast<uint32_t>(t)));
         else if constexpr (sizeof(T) == 8)
-            return tcp_bswap64((uint64_t)t);
+            return std::bit_cast<T>(tcp_bswap64(std::bit_cast<uint64_t>(t)));
         else
-            return t;
+            static_assert(!sizeof(T), "Unsupported size for Endian::Convert");
     }
 
     template<class T>
