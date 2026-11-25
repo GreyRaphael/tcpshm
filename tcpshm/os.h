@@ -257,23 +257,8 @@ inline uint64_t tcp_bswap64(uint64_t x) { return __builtin_bswap64(x); }
 #endif
 
 // ============================================================
-// Synchronization primitives (C++11 memory model)
+// Synchronization primitives
 // ============================================================
-
-// Force the compiler and hardware to read a variable from memory (Acquire)
-template<class T>
-inline T tcp_volatile_read(const T& x) {
-  T val = *(const volatile T*)&x;
-  std::atomic_thread_fence(std::memory_order_acquire);
-  return val;
-}
-
-// Force the compiler and hardware to write a variable to memory (Release)
-template<class T>
-inline void tcp_volatile_write(T& x, const T& val) {
-  std::atomic_thread_fence(std::memory_order_release);
-  *(volatile T*)&x = val;
-}
 
 inline void tcp_compiler_barrier() {
   std::atomic_signal_fence(std::memory_order_acq_rel);

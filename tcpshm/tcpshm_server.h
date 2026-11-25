@@ -23,9 +23,12 @@ SOFTWARE.
 */
 
 #pragma once
-#include <string>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <thread>
 #include "os.h"
 #include "tcpshm_conn.h"
 
@@ -102,11 +105,21 @@ protected:
             static_cast<Derived*>(this)->OnSystemError("listen", tcp_get_last_error());
             return false;
         }
+        for(auto& grp : shm_grps_) {
+            grp.ctl_dirty.store(false, std::memory_order_relaxed);
+            grp.active_cnt = 0;
+        }
+        for(auto& grp : tcp_grps_) {
+            grp.ctl_dirty.store(false, std::memory_order_relaxed);
+            grp.active_cnt = 0;
+        }
+        stopping_.store(false, std::memory_order_release);
         return true;
     }
 
     // poll control for handling new connections and keep shm connections alive
     void PollCtl(int64_t now) {
+        if(listenfd_ == INVALID_TCP_SOCKET || stopping_.load(std::memory_order_acquire)) return;
         // every poll we accept only one connection
         if(avail_idx_ != Conf::MaxNewConnections) {
             NewConn& conn = new_conns_[avail_idx_];
@@ -151,35 +164,49 @@ protected:
                 conn.fd = INVALID_TCP_SOCKET;
             }
             avail_idx_ = i;
+            if(stopping_.load(std::memory_order_acquire)) return;
         }
 
         for(auto& grp : shm_grps_) {
-            for(int i = 0; i < grp.live_cnt;) {
+            for(uint32_t i = 0; i < Conf::MaxShmConnsPerGrp; i++) {
+                uint8_t st = grp.slot_state[i].load(std::memory_order_acquire);
+                if(st == SLOT_FREE) continue;
                 Connection& conn = *grp.conns[i];
-                conn.TcpFront(now); // poll heartbeats, ignore return
-                if(conn.TryCloseFd()) {
+                if(st == SLOT_PENDING_ADD || st == SLOT_LIVE) {
+                    conn.TcpFront(now); // poll heartbeats, ignore return
+                    if(conn.TryCloseFd()) {
+                        uint8_t cur = st;
+                        while(cur == SLOT_PENDING_ADD || cur == SLOT_LIVE) {
+                            if(grp.slot_state[i].compare_exchange_weak(
+                                   cur, SLOT_RETIRE_REQ, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                                grp.ctl_dirty.store(true, std::memory_order_release);
+                                break;
+                            }
+                        }
+                    }
+                }
+                else if(st == SLOT_RETIRED) {
                     int sys_errno;
                     const char* reason = conn.GetCloseReason(&sys_errno);
                     static_cast<Derived*>(this)->OnClientDisconnected(conn, reason, sys_errno);
-                    std::swap(grp.conns[i], grp.conns[--grp.live_cnt]);
-                }
-                else {
-                    i++;
+                    if(stopping_.load(std::memory_order_acquire)) return;
+                    conn.Release();
+                    grp.slot_state[i].store(SLOT_FREE, std::memory_order_release);
                 }
             }
         }
 
         for(auto& grp : tcp_grps_) {
-            for(int i = 0; i < grp.live_cnt;) {
-                Connection& conn = *grp.conns[i];
-                if(conn.TryCloseFd()) {
+            for(uint32_t i = 0; i < Conf::MaxTcpConnsPerGrp; i++) {
+                uint8_t st = grp.slot_state[i].load(std::memory_order_acquire);
+                if(st == SLOT_RETIRED) {
+                    Connection& conn = *grp.conns[i];
                     int sys_errno;
                     const char* reason = conn.GetCloseReason(&sys_errno);
                     static_cast<Derived*>(this)->OnClientDisconnected(conn, reason, sys_errno);
-                    std::swap(grp.conns[i], grp.conns[--grp.live_cnt]);
-                }
-                else {
-                    i++;
+                    if(stopping_.load(std::memory_order_acquire)) return;
+                    conn.Release();
+                    grp.slot_state[i].store(SLOT_FREE, std::memory_order_release);
                 }
             }
         }
@@ -188,31 +215,67 @@ protected:
     // poll tcp for serving tcp connections
     void PollTcp(int64_t now, int grpid) {
         auto& grp = tcp_grps_[grpid];
-        // force read grp.live_cnt from memory, it could have been changed by Ctl thread
-        tcp_volatile_read(grp.live_cnt);
-        for(int i = 0; i < grp.live_cnt; i++) {
-            // it's possible that grp.conns is being swapped by Ctl thread
-            // so some live conn could be missed, some closed one could be visited
-            // even some conn could be visited twice, but those're all fine
-            Connection& conn = *grp.conns[i];
+        if(stopping_.load(std::memory_order_acquire)) {
+            RetireActiveTcp(grp);
+            return;
+        }
+        if(grp.ctl_dirty.load(std::memory_order_acquire)) {
+            SyncTcpGroup(grp);
+        }
+        for(uint32_t j = 0; j < grp.active_cnt;) {
+            uint32_t slot = grp.active_slots[j];
+            Connection& conn = *grp.conns[slot];
             MsgHeader* head = conn.TcpFront(now);
             if(head) static_cast<Derived*>(this)->OnClientMsg(conn, head);
+            if(stopping_.load(std::memory_order_acquire)) {
+                RetireActiveTcp(grp);
+                return;
+            }
+            if(conn.TryCloseFd()) {
+                grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+                grp.slot_state[slot].store(SLOT_RETIRED, std::memory_order_release);
+            }
+            else if(grp.slot_state[slot].load(std::memory_order_acquire) == SLOT_RETIRE_REQ) {
+                conn.Close();
+                conn.TryCloseFd();
+                grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+                grp.slot_state[slot].store(SLOT_RETIRED, std::memory_order_release);
+            }
+            else {
+                j++;
+            }
         }
     }
 
     // poll shm for serving shm connections
     void PollShm(int grpid) {
         auto& grp = shm_grps_[grpid];
-        tcp_volatile_read(grp.live_cnt);
-        for(int i = 0; i < grp.live_cnt; i++) {
-            Connection& conn = *grp.conns[i];
+        if(stopping_.load(std::memory_order_acquire)) {
+            RetireActiveShm(grp);
+            return;
+        }
+        if(grp.ctl_dirty.load(std::memory_order_acquire)) {
+            SyncShmGroup(grp);
+        }
+        for(uint32_t j = 0; j < grp.active_cnt; j++) {
+            uint32_t slot = grp.active_slots[j];
+            Connection& conn = *grp.conns[slot];
             MsgHeader* head = conn.ShmFront();
             if(head) static_cast<Derived*>(this)->OnClientMsg(conn, head);
+            if(stopping_.load(std::memory_order_acquire)) {
+                RetireActiveShm(grp);
+                return;
+            }
         }
     }
 
     void Stop() {
+        if(in_stop_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        stopping_.store(true, std::memory_order_release);
         if(listenfd_ == INVALID_TCP_SOCKET) {
+            in_stop_.store(false, std::memory_order_release);
             return;
         }
         tcp_close(listenfd_);
@@ -225,21 +288,83 @@ protected:
             }
         }
         avail_idx_ = 0;
-        for(auto& grp : shm_grps_) {
-            for(auto& conn : grp.conns) {
-                conn->Release();
+
+        auto request_retire_all = [](auto* grps, uint32_t grp_cnt, uint32_t slots_per_grp) {
+            bool any_pending = false;
+            for(uint32_t g = 0; g < grp_cnt; g++) {
+                auto& grp = grps[g];
+                bool dirty = false;
+                for(uint32_t i = 0; i < slots_per_grp; i++) {
+                    uint8_t st = grp.slot_state[i].load(std::memory_order_acquire);
+                    while(st == SLOT_PENDING_ADD || st == SLOT_LIVE) {
+                        if(grp.slot_state[i].compare_exchange_weak(
+                               st, SLOT_RETIRE_REQ, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                            dirty = true;
+                            any_pending = true;
+                            break;
+                        }
+                    }
+                    if(st == SLOT_RETIRE_REQ) {
+                        dirty = true;
+                        any_pending = true;
+                    }
+                }
+                if(dirty) grp.ctl_dirty.store(true, std::memory_order_release);
             }
-            grp.live_cnt = 0;
-        }
-        for(auto& grp : tcp_grps_) {
-            for(auto& conn : grp.conns) {
-                conn->Release();
+            return any_pending;
+        };
+
+        bool pending_shm = request_retire_all(shm_grps_, Conf::MaxShmGrps, Conf::MaxShmConnsPerGrp);
+        bool pending_tcp = request_retire_all(tcp_grps_, Conf::MaxTcpGrps, Conf::MaxTcpConnsPerGrp);
+
+        if(pending_shm || pending_tcp) {
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+            while(std::chrono::steady_clock::now() < deadline) {
+                auto has_unretired = [](auto* grps, uint32_t grp_cnt, uint32_t slots_per_grp) {
+                    for(uint32_t g = 0; g < grp_cnt; g++) {
+                        for(uint32_t i = 0; i < slots_per_grp; i++) {
+                            uint8_t st = grps[g].slot_state[i].load(std::memory_order_acquire);
+                            if(st != SLOT_FREE && st != SLOT_RETIRED) return true;
+                        }
+                    }
+                    return false;
+                };
+                if(!has_unretired(shm_grps_, Conf::MaxShmGrps, Conf::MaxShmConnsPerGrp) &&
+                   !has_unretired(tcp_grps_, Conf::MaxTcpGrps, Conf::MaxTcpConnsPerGrp)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
-            grp.live_cnt = 0;
         }
+
+        auto drain_grps = [](auto* grps, uint32_t grp_cnt, uint32_t slots_per_grp) {
+            for(uint32_t g = 0; g < grp_cnt; g++) {
+                auto& grp = grps[g];
+                for(uint32_t i = 0; i < slots_per_grp; i++) {
+                    uint8_t st = grp.slot_state[i].load(std::memory_order_acquire);
+                    if(st != SLOT_FREE) {
+                        grp.conns[i]->Release();
+                        grp.slot_state[i].store(SLOT_FREE, std::memory_order_release);
+                    }
+                }
+                grp.ctl_dirty.store(false, std::memory_order_release);
+            }
+        };
+        drain_grps(shm_grps_, Conf::MaxShmGrps, Conf::MaxShmConnsPerGrp);
+        drain_grps(tcp_grps_, Conf::MaxTcpGrps, Conf::MaxTcpConnsPerGrp);
+        in_stop_.store(false, std::memory_order_release);
     }
 
 private:
+    enum SlotState : uint8_t
+    {
+        SLOT_FREE = 0,
+        SLOT_PENDING_ADD = 1,
+        SLOT_LIVE = 2,
+        SLOT_RETIRE_REQ = 3,
+        SLOT_RETIRED = 4,
+    };
+
     struct NewConn
     {
         int64_t time;
@@ -250,9 +375,94 @@ private:
     template<uint32_t N>
     struct alignas(64) ConnectionGroup
     {
-        uint32_t live_cnt = 0;
-        Connection* conns[N];
+        Connection* conns[N]{};
+        alignas(64) std::atomic<bool> ctl_dirty{false};
+        std::atomic<uint8_t> slot_state[N]{};
+        alignas(64) uint32_t active_cnt = 0;
+        uint32_t active_slots[N]{};
     };
+
+    template<uint32_t N>
+    void SyncTcpGroup(ConnectionGroup<N>& grp) {
+        grp.ctl_dirty.exchange(false, std::memory_order_acq_rel);
+        for(uint32_t i = 0; i < N; i++) {
+            uint8_t st = grp.slot_state[i].load(std::memory_order_acquire);
+            if(st == SLOT_PENDING_ADD) {
+                uint8_t expected = SLOT_PENDING_ADD;
+                if(grp.slot_state[i].compare_exchange_strong(
+                       expected, SLOT_LIVE, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    grp.active_slots[grp.active_cnt++] = i;
+                }
+                else if(expected == SLOT_RETIRE_REQ) {
+                    grp.conns[i]->Close();
+                    grp.conns[i]->TryCloseFd();
+                    grp.slot_state[i].store(SLOT_RETIRED, std::memory_order_release);
+                }
+            }
+            else if(st == SLOT_RETIRE_REQ) {
+                for(uint32_t j = 0; j < grp.active_cnt; j++) {
+                    if(grp.active_slots[j] == i) {
+                        grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+                        break;
+                    }
+                }
+                grp.conns[i]->Close();
+                grp.conns[i]->TryCloseFd();
+                grp.slot_state[i].store(SLOT_RETIRED, std::memory_order_release);
+            }
+        }
+    }
+
+    template<uint32_t N>
+    void SyncShmGroup(ConnectionGroup<N>& grp) {
+        grp.ctl_dirty.exchange(false, std::memory_order_acq_rel);
+        for(uint32_t i = 0; i < N; i++) {
+            uint8_t st = grp.slot_state[i].load(std::memory_order_acquire);
+            if(st == SLOT_PENDING_ADD) {
+                uint8_t expected = SLOT_PENDING_ADD;
+                if(grp.slot_state[i].compare_exchange_strong(
+                       expected, SLOT_LIVE, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    grp.active_slots[grp.active_cnt++] = i;
+                }
+                else if(expected == SLOT_RETIRE_REQ) {
+                    grp.slot_state[i].store(SLOT_RETIRED, std::memory_order_release);
+                }
+            }
+            else if(st == SLOT_RETIRE_REQ) {
+                for(uint32_t j = 0; j < grp.active_cnt; j++) {
+                    if(grp.active_slots[j] == i) {
+                        grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+                        break;
+                    }
+                }
+                grp.slot_state[i].store(SLOT_RETIRED, std::memory_order_release);
+            }
+        }
+    }
+
+    template<uint32_t N>
+    static void RetireActiveTcp(ConnectionGroup<N>& grp) {
+        for(uint32_t j = 0; j < grp.active_cnt; j++) {
+            uint32_t s = grp.active_slots[j];
+            if(grp.slot_state[s].load(std::memory_order_acquire) == SLOT_RETIRE_REQ) {
+                grp.conns[s]->Close();
+                grp.conns[s]->TryCloseFd();
+                grp.slot_state[s].store(SLOT_RETIRED, std::memory_order_release);
+            }
+        }
+        grp.active_cnt = 0;
+    }
+
+    template<uint32_t N>
+    static void RetireActiveShm(ConnectionGroup<N>& grp) {
+        for(uint32_t j = 0; j < grp.active_cnt; j++) {
+            uint32_t s = grp.active_slots[j];
+            if(grp.slot_state[s].load(std::memory_order_acquire) == SLOT_RETIRE_REQ) {
+                grp.slot_state[s].store(SLOT_RETIRED, std::memory_order_release);
+            }
+        }
+        grp.active_cnt = 0;
+    }
 
     template<uint32_t N>
     void HandleLogin(int64_t now, NewConn& conn, ConnectionGroup<N>* grps) {
@@ -287,83 +497,90 @@ private:
             return;
         }
         auto& grp = grps[grpid];
-        for(int i = 0; i < N; i++) {
-            Connection& curconn = *grp.conns[i];
-            char* remote_name = curconn.GetRemoteName();
-            if(remote_name[0] == 0) { // found an unused one, use it then
-                strncpy(remote_name, login->client_name, sizeof(login->client_name));
-            }
-            if(strncmp(remote_name, login->client_name, sizeof(login->client_name)) != 0) {
-                // client name does not match
+        int free_idx = -1;
+        for(uint32_t i = 0; i < N; i++) {
+            uint8_t st = grp.slot_state[i].load(std::memory_order_acquire);
+            if(st == SLOT_FREE) {
+                if(free_idx < 0) free_idx = static_cast<int>(i);
                 continue;
             }
-            // match
-            if(i < grp.live_cnt) {
+            if(strncmp(grp.conns[i]->GetRemoteName(), login->client_name, sizeof(login->client_name)) == 0) {
                 strncpy(login_rsp->error_msg, "Already loggned on", sizeof(login_rsp->error_msg));
                 SendLoginRsp(conn.fd, sendbuf, login_rsp);
                 return;
             }
+        }
+        if(free_idx < 0) {
+            // no space for new remote name
+            strncpy(login_rsp->error_msg, "Max client cnt exceeded", sizeof(login_rsp->error_msg));
+            SendLoginRsp(conn.fd, sendbuf, login_rsp);
+            return;
+        }
 
-            const char* error_msg;
-            if(!curconn.OpenFile(login->use_shm, &error_msg)) {
-                // we can not mmap to ptcp or chm files with filenames related to local and remote name
+        Connection& curconn = *grp.conns[free_idx];
+        char* remote_name = curconn.GetRemoteName();
+        strncpy(remote_name, login->client_name, sizeof(login->client_name));
+
+        const char* error_msg;
+        if(!curconn.OpenFile(login->use_shm, &error_msg)) {
+            // we can not mmap to ptcp or chm files with filenames related to local and remote name
+            static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
+            strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg));
+            SendLoginRsp(conn.fd, sendbuf, login_rsp);
+            return;
+        }
+        uint32_t local_ack_seq = 0;
+        uint32_t local_seq_start = 0;
+        uint32_t local_seq_end = 0;
+        uint32_t remote_ack_seq = conn.recvbuf[0].ack_seq;
+        uint32_t remote_seq_start = login->client_seq_start;
+        uint32_t remote_seq_end = login->client_seq_end;
+        // if server_name has changed, reset the ack_seq
+        if(strncmp(login->last_server_name, server_name_, sizeof(server_name_)) != 0) {
+            curconn.Reset();
+            remote_ack_seq = remote_seq_start = remote_seq_end = 0;
+        }
+        else {
+            if(!curconn.GetSeq(&local_ack_seq, &local_seq_start, &local_seq_end, &error_msg)) {
                 static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
                 strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg));
                 SendLoginRsp(conn.fd, sendbuf, login_rsp);
                 return;
             }
-            uint32_t local_ack_seq = 0;
-            uint32_t local_seq_start = 0;
-            uint32_t local_seq_end = 0;
-            uint32_t remote_ack_seq = conn.recvbuf[0].ack_seq;
-            uint32_t remote_seq_start = login->client_seq_start;
-            uint32_t remote_seq_end = login->client_seq_end;
-            // if server_name has changed, reset the ack_seq
-            if(strncmp(login->last_server_name, server_name_, sizeof(server_name_)) != 0) {
-                curconn.Reset();
-                remote_ack_seq = remote_seq_start = remote_seq_end = 0;
-            }
-            else {
-                if(!curconn.GetSeq(&local_ack_seq, &local_seq_start, &local_seq_end, &error_msg)) {
-                    static_cast<Derived*>(this)->OnClientFileError(curconn, error_msg, tcp_get_last_error());
-                    strncpy(login_rsp->error_msg, "System error", sizeof(login_rsp->error_msg));
-                    SendLoginRsp(conn.fd, sendbuf, login_rsp);
-                    return;
-                }
-            }
-            sendbuf[0].ack_seq = local_ack_seq;
-            login_rsp->server_seq_start = local_seq_start;
-            login_rsp->server_seq_end = local_seq_end;
-            if(!CheckAckInQueue(remote_ack_seq, local_seq_start, local_seq_end) ||
-               !CheckAckInQueue(local_ack_seq, remote_seq_start, remote_seq_end)) {
-                static_cast<Derived*>(this)->OnSeqNumberMismatch(curconn,
-                                                                 local_ack_seq,
-                                                                 local_seq_start,
-                                                                 local_seq_end,
-                                                                 remote_ack_seq,
-                                                                 remote_seq_start,
-                                                                 remote_seq_end);
-                login_rsp->status = 1;
-                SendLoginRsp(conn.fd, sendbuf, login_rsp);
-                return;
-            }
-
-            // send Login OK
-            login_rsp->status = 0;
-            if(!SendLoginRsp(conn.fd, sendbuf, login_rsp)) {
-                return;
-            }
-            tcp_set_nonblocking(conn.fd);
-            curconn.Open(conn.fd, remote_ack_seq, now);
-            conn.fd = INVALID_TCP_SOCKET; // so it won't be closed by caller
-            // switch to live
-            std::swap(grp.conns[i], grp.conns[grp.live_cnt++]);
-            static_cast<Derived*>(this)->OnClientLogon(conn.addr, curconn);
+        }
+        sendbuf[0].ack_seq = local_ack_seq;
+        login_rsp->server_seq_start = local_seq_start;
+        login_rsp->server_seq_end = local_seq_end;
+        if(!CheckAckInQueue(remote_ack_seq, local_seq_start, local_seq_end) ||
+           !CheckAckInQueue(local_ack_seq, remote_seq_start, remote_seq_end)) {
+            static_cast<Derived*>(this)->OnSeqNumberMismatch(curconn,
+                                                             local_ack_seq,
+                                                             local_seq_start,
+                                                             local_seq_end,
+                                                             remote_ack_seq,
+                                                             remote_seq_start,
+                                                             remote_seq_end);
+            login_rsp->status = 1;
+            SendLoginRsp(conn.fd, sendbuf, login_rsp);
             return;
         }
-        // no space for new remote name
-        strncpy(login_rsp->error_msg, "Max client cnt exceeded", sizeof(login_rsp->error_msg));
-        SendLoginRsp(conn.fd, sendbuf, login_rsp);
+
+        // send Login OK
+        login_rsp->status = 0;
+        if(!SendLoginRsp(conn.fd, sendbuf, login_rsp)) {
+            return;
+        }
+        tcp_set_nonblocking(conn.fd);
+        curconn.Open(conn.fd, remote_ack_seq, now);
+        conn.fd = INVALID_TCP_SOCKET; // so it won't be closed by caller
+        // Invoke OnClientLogon BEFORE publishing slot to worker threads
+        static_cast<Derived*>(this)->OnClientLogon(conn.addr, curconn);
+        if(stopping_.load(std::memory_order_acquire)) {
+            curconn.Release();
+            return;
+        }
+        grp.slot_state[free_idx].store(SLOT_PENDING_ADD, std::memory_order_release);
+        grp.ctl_dirty.store(true, std::memory_order_release);
     }
 
     // check if seq_start <= ack_seq <= seq_end, considering uint32_t wrap around
@@ -399,8 +616,8 @@ private:
         const char* error_msg = nullptr;
         ShmProbeData* probe = my_mmap<ShmProbeData>(probe_name, true, &error_msg);
         if(!probe) return false;
-        probe->token = token;
-        probe->ack = 0;
+        std::atomic_ref<uint64_t>(probe->token).store(token, std::memory_order_relaxed);
+        std::atomic_ref<uint64_t>(probe->ack).store(0, std::memory_order_release);
 
         bool ok = SendShmProbeReq(fd, probe_name, token) &&
                   RecvAndCheckShmProbeRsp(fd, token, probe);
@@ -438,7 +655,7 @@ private:
         uint64_t expected_ack = token ^ ShmProbeAckMask;
         return rsp->ok &&
                rsp->ack == expected_ack &&
-               tcp_volatile_read(probe->ack) == expected_ack;
+               std::atomic_ref<uint64_t>(probe->ack).load(std::memory_order_acquire) == expected_ack;
     }
 
     uint64_t MakeShmProbeToken(const char* client_name) const {
@@ -458,6 +675,8 @@ private:
 
     NewConn new_conns_[Conf::MaxNewConnections];
     int avail_idx_ = 0;
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> in_stop_{false};
 
     Connection conn_pool_[Conf::MaxShmConnsPerGrp * Conf::MaxShmGrps + Conf::MaxTcpConnsPerGrp * Conf::MaxTcpGrps];
     ConnectionGroup<Conf::MaxShmConnsPerGrp> shm_grps_[Conf::MaxShmGrps];

@@ -26,6 +26,7 @@ SOFTWARE.
 #include "ptcp_conn.h"
 #include "spsc_varq.h"
 #include "os.h"
+#include <new>
 
 namespace tcpshm {
 
@@ -151,8 +152,8 @@ private:
 
     void Reset() {
         if(shm_sendq_) {
-            memset(shm_sendq_, 0, sizeof(SHMQ));
-            memset(shm_recvq_, 0, sizeof(SHMQ));
+            new (shm_sendq_) SHMQ();
+            new (shm_recvq_) SHMQ();
         }
         else {
             ptcp_conn_.Reset();
@@ -181,6 +182,7 @@ private:
     }
 
     MsgHeader* TcpFront(int64_t now) {
+        if(ptcp_conn_.IsClosed()) return nullptr;
         ptcp_conn_.SendHB(now);
         return ptcp_conn_.Front(); // for shm, we need to recv HB and Front() always return nullptr
     }

@@ -23,6 +23,7 @@ SOFTWARE.
 */
 
 #pragma once
+#include <atomic>
 #include <string>
 #include <array>
 #include "os.h"
@@ -181,7 +182,7 @@ protected:
                 return false;
             }
         }
-        if(server_name_changed) {
+        if(server_name_changed && !use_shm) {
             conn_.Reset();
         }
         tcp_set_nonblocking(fd);
@@ -294,9 +295,9 @@ private:
         const char* mmap_error = nullptr;
         ShmProbeData* probe = my_mmap_existing<ShmProbeData>(req->shm_name, true, &mmap_error);
         if(probe) {
-            if(probe->token == req->token) {
+            if(std::atomic_ref<uint64_t>(probe->token).load(std::memory_order_acquire) == req->token) {
                 ack = req->token ^ ShmProbeAckMask;
-                tcp_volatile_write(probe->ack, ack);
+                std::atomic_ref<uint64_t>(probe->ack).store(ack, std::memory_order_release);
                 ok = 1;
             }
             my_munmap<ShmProbeData>(probe);

@@ -26,6 +26,7 @@ SOFTWARE.
 #include "ptcp_queue.h"
 #include "mmap.h"
 #include "os.h"
+#include <atomic>
 #include <memory>
 
 namespace tcpshm {
@@ -41,9 +42,10 @@ constexpr uint32_t ShmProbeNameSize = 64;
 
 struct ShmProbeData
 {
-    uint64_t token;
-    uint64_t ack;
+    alignas(8) uint64_t token;
+    alignas(8) uint64_t ack;
 };
+static_assert(std::atomic_ref<uint64_t>::is_always_lock_free, "atomic_ref<uint64_t> must be lock-free");
 
 struct ShmProbeReqMsg
 {
@@ -155,16 +157,21 @@ public:
 
     // precondition: sockfd_ == fd_to_close_ == -1 (or INVALID_TCP_SOCKET)
     void Open(tcp_socket_t sock_fd, uint32_t remote_ack_seq, int64_t now) {
-        sockfd_ = fd_to_close_ = sock_fd;
+        close_reason_ = "nil";
+        close_errno_ = 0;
+        fd_to_close_ = sock_fd;
+        sockfd_.store(sock_fd, std::memory_order_relaxed);
+        close_claimed_.store(false, std::memory_order_release);
         writeidx_ = readidx_ = nextmsg_idx_ = 0;
+        last_my_ack_ = q_ ? q_->MyAck() : 0;
         recv_time_ = send_time_ = now_ = now;
-        if(q_) {
-            q_->LoginAck(remote_ack_seq);
-            SendPending();
-        }
         if(recvbuf_size_ == 0) {
             recvbuf_size_ = Conf::TcpRecvBufInitSize;
             recvbuf_.reset(new char[recvbuf_size_]);
+        }
+        if(q_) {
+            q_->LoginAck(remote_ack_seq);
+            SendPending();
         }
     }
 
@@ -183,6 +190,7 @@ public:
 
     // safe if IsClosed
     MsgHeader* Front() {
+        if(IsClosed()) return nullptr;
         if(UseShm()) { // for shm, we only expect HB in tcp channel so just read something and ignore
             DoRecv();
             return nullptr;
@@ -244,13 +252,15 @@ public:
 
     // safe if IsClosed
     void SendHB(int64_t now) {
+        tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
+        if(fd == INVALID_TCP_SOCKET) return;
         now_ = now;
         if(now_ - send_time_ < Conf::HeartBeatInverval) return;
         if(q_) {
             if(SendPending()) return;
             hbmsg_.ack_seq = Endian<Conf::ToLittleEndian>::Convert(q_->MyAck());
         }
-        int sent = tcp_send(sockfd_, (const char*)&hbmsg_, sizeof(hbmsg_), TCP_MSG_NOSIGNAL);
+        int sent = tcp_send(fd, (const char*)&hbmsg_, sizeof(hbmsg_), TCP_MSG_NOSIGNAL);
         if(sent < 0 && tcp_get_last_error() == TCP_ERR_AGAIN) return;
         if(sent != (int)sizeof(MsgHeader)) { // for simplicity, we see partial sendout as error
             Close("Send error", sent < 0 ? tcp_get_last_error() : 0);
@@ -261,13 +271,14 @@ public:
 
     // return false only if no pending data to send
     bool SendPending() {
-        if(IsClosed()) return false;
+        tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
+        if(fd == INVALID_TCP_SOCKET) return false;
         int blk_sz;
         const char* p = (char*)q_->GetSendable(blk_sz);
         if(blk_sz == 0) return false;
         uint32_t size = blk_sz << 3;
         do {
-            int sent = tcp_send(sockfd_, p, size, TCP_MSG_NOSIGNAL);
+            int sent = tcp_send(fd, p, size, TCP_MSG_NOSIGNAL);
             if(sent < 0) {
                 int err = tcp_get_last_error();
                 if(err != TCP_ERR_AGAIN || (size & 7)) {
@@ -288,13 +299,13 @@ public:
         return true;
     }
 
-    bool IsClosed() {
-        return sockfd_ == INVALID_TCP_SOCKET;
+    bool IsClosed() const {
+        return sockfd_.load(std::memory_order_acquire) == INVALID_TCP_SOCKET;
     }
 
     // not thread safe
     bool TryCloseFd() {
-        if(sockfd_ == INVALID_TCP_SOCKET && fd_to_close_ != INVALID_TCP_SOCKET) {
+        if(sockfd_.load(std::memory_order_acquire) == INVALID_TCP_SOCKET && fd_to_close_ != INVALID_TCP_SOCKET) {
             tcp_close(fd_to_close_);
             fd_to_close_ = INVALID_TCP_SOCKET;
             return true;
@@ -319,14 +330,16 @@ private:
     // thread safe
     // need to call TryCloseFd to really close it
     void Close(const char* reason, int sys_errno) {
-        if(sockfd_ == INVALID_TCP_SOCKET) return;
-        sockfd_ = INVALID_TCP_SOCKET;
+        if(close_claimed_.exchange(true, std::memory_order_acq_rel)) return;
         close_reason_ = reason;
         close_errno_ = sys_errno;
+        sockfd_.store(INVALID_TCP_SOCKET, std::memory_order_release);
     }
 
     // For Windows: use WSARecv to simulate readv
     int DoRecv() {
+        tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
+        if(fd == INVALID_TCP_SOCKET) return 0;
         char stackbuf[65536];
         if(readidx_ > 0 && readidx_ == writeidx_) {
             readidx_ = nextmsg_idx_ = writeidx_ = 0;
@@ -340,7 +353,7 @@ private:
         if(writable + extra_size == 0) return 0;
         int ret;
         if(extra_size == 0){
-            ret = tcp_recv(sockfd_, &recvbuf_[writeidx_], writable, 0);
+            ret = tcp_recv(fd, &recvbuf_[writeidx_], writable, 0);
         }
         else {
             struct iovec vec[2];
@@ -348,7 +361,7 @@ private:
             vec[0].iov_len = writable;
             vec[1].iov_base = stackbuf;
             vec[1].iov_len = extra_size;
-            ret = tcp_readv(sockfd_, vec);
+            ret = tcp_readv(fd, vec);
         }
         if(ret <= 0) {
             if(ret < 0) {
@@ -395,7 +408,8 @@ private:
 private:
     using PTCPQ = PTCPQueue<Conf::TcpQueueSize, Conf::ToLittleEndian>;
     PTCPQ* q_ = nullptr; // may be mmaped to file
-    tcp_socket_t sockfd_ = INVALID_TCP_SOCKET;
+    std::atomic<tcp_socket_t> sockfd_{INVALID_TCP_SOCKET};
+    std::atomic<bool> close_claimed_{true};
     tcp_socket_t fd_to_close_ = INVALID_TCP_SOCKET;
     const char* close_reason_ = "nil";
     int close_errno_ = 0;

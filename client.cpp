@@ -1,7 +1,10 @@
+#include <atomic>
 #include <chrono>
+#include <deque>
 #include <exception>
 #include <iguana/iguana.hpp>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -89,25 +92,46 @@ class StringClient : public TSClient {
     void Run(const char* server_ip, uint16_t port, bool use_shm) {
         if (!Connect(use_shm, server_ip, port, 0)) return;
 
-        // 轮询线程：不再使用 cpupin，降低对系统的独占
-        thread poll_thr([this, use_shm]() {
+        std::mutex tx_mtx;
+        std::deque<std::string> tx_queue;
+        std::atomic<bool> quit{false};
+
+        // 轮询线程：独占调用 Alloc/Push/Front/Pop/Close
+        thread poll_thr([this, use_shm, &tx_mtx, &tx_queue, &quit]() {
             while (!conn.IsClosed()) {
                 if (use_shm) PollShm();
                 PollTcp(get_timestamp());
-                // 适当休眠防止 100% CPU 占用（如果不追求极致延迟）
+                if (conn.IsClosed()) break;
+
+                std::deque<std::string> batch;
+                {
+                    std::lock_guard<std::mutex> lock(tx_mtx);
+                    batch.swap(tx_queue);
+                }
+                for (const auto& msg : batch) {
+                    Send(msg);
+                }
+                if (quit.load(std::memory_order_acquire)) {
+                    conn.Close();
+                    PollTcp(get_timestamp());
+                    break;
+                }
                 this_thread::sleep_for(chrono::microseconds(100));
             }
         });
 
         cout << "Enter text to send (type 'exit' to stop):" << endl;
         string input;
-        while (true) {
+        while (!conn.IsClosed()) {
             cout << "> ";
             if (!getline(cin, input) || input == "exit") break;
-            Send(input);
+            {
+                std::lock_guard<std::mutex> lock(tx_mtx);
+                tx_queue.push_back(std::move(input));
+            }
         }
 
-        conn.Close();
+        quit.store(true, std::memory_order_release);
         if (poll_thr.joinable()) poll_thr.join();
         Stop();
     }
