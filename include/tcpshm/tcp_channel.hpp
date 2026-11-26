@@ -98,17 +98,20 @@ public:
     void commit_pending() noexcept {
         if (!q_) [[unlikely]] return;
         q_->push_pending();
+        staged_ = false;
         flush();
     }
 
     void stage_pending() noexcept {
         if (!q_) [[unlikely]] return;
         q_->push_pending();
+        staged_ = true;
     }
 
     void cancel_pending() noexcept {}
 
     bool flush() noexcept {
+        staged_ = false;
         detail::socket_t fd = sockfd_.load(std::memory_order_acquire);
         if (fd == detail::kInvalidSocket || !q_) [[unlikely]] return false;
         return send_pending_with_fd(fd);
@@ -356,8 +359,12 @@ private:
             ++q_->my_ack();
             ++consumed;
             if (sockfd_.load(std::memory_order_acquire) == detail::kInvalidSocket) [[unlikely]] {
+                staged_ = false;
                 break;
             }
+        }
+        if (staged_) [[unlikely]] {
+            flush();
         }
         return consumed;
     }
@@ -518,6 +525,7 @@ private:
     FrameHeader hb_frame_{};
     uint8_t send_byte_off_ = 0;
     uint8_t hb_send_off_ = 0;
+    bool staged_ = false;
 };
 
 } // namespace tcpshm

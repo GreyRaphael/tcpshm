@@ -1,5 +1,4 @@
-#include "tcpshm/tcpshm_client.h"
-#include "tcpshm/tcpshm_server.h"
+#include "tcpshm/tcpshm.hpp"
 
 #include <algorithm>
 #include <array>
@@ -7,7 +6,6 @@
 #include <bit>
 #include <charconv>
 #include <chrono>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -28,8 +26,11 @@
 #ifdef _WIN32
 #include <process.h>
 #else
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -48,66 +49,26 @@ using namespace tcpshm;
 consteval uint32_t KiB(uint32_t n) { return n * 1024u; }
 consteval uint32_t MiB(uint32_t n) { return n * 1024u * 1024u; }
 
-template <class Conf>
-concept ValidBenchConf = requires {
-    { Conf::NameSize } -> std::convertible_to<uint32_t>;
-    { Conf::ShmQueueSize } -> std::convertible_to<uint32_t>;
-    { Conf::TcpQueueSize } -> std::convertible_to<uint32_t>;
-    { Conf::TcpRecvBufInitSize } -> std::convertible_to<uint32_t>;
-    { Conf::TcpRecvBufMaxSize } -> std::convertible_to<uint32_t>;
-    { Conf::ToLittleEndian } -> std::convertible_to<bool>;
-    { Conf::TcpNoDelay } -> std::convertible_to<bool>;
-    { Conf::MaxNewConnections } -> std::convertible_to<uint32_t>;
-    { Conf::MaxShmGrps } -> std::convertible_to<uint32_t>;
-    { Conf::MaxShmConnsPerGrp } -> std::convertible_to<uint32_t>;
-    { Conf::MaxTcpGrps } -> std::convertible_to<uint32_t>;
-    { Conf::MaxTcpConnsPerGrp } -> std::convertible_to<uint32_t>;
-    typename Conf::LoginUserData;
-    typename Conf::LoginRspUserData;
-    typename Conf::ConnectionUserData;
-} && (Conf::NameSize >= 8u)
-  && (Conf::ShmQueueSize >= 64u)
-  && (Conf::ShmQueueSize % 64u == 0u)
-  && std::has_single_bit(Conf::ShmQueueSize / 64u)
-  && (Conf::TcpQueueSize >= 8u && Conf::TcpQueueSize % 8u == 0u)
-  && (Conf::TcpRecvBufInitSize >= 8u && Conf::TcpRecvBufInitSize % 8u == 0u)
-  && (Conf::TcpRecvBufMaxSize >= Conf::TcpRecvBufInitSize && Conf::TcpRecvBufMaxSize % 8u == 0u);
-
-template <class Q>
-concept SpscQueueLike = requires(Q& q, uint16_t sz) {
-    { q.Alloc(sz) } -> std::same_as<MsgHeader*>;
-    { q.Push() } -> std::same_as<void>;
-    { q.Front() } -> std::same_as<MsgHeader*>;
-    { q.Pop() } -> std::same_as<void>;
+struct BenchConfig : DefaultConfig
+{
+    static constexpr uint32_t name_size = 16;
+    static constexpr uint32_t shm_queue_bytes = MiB(1);
+    static constexpr uint32_t shm_block_bytes = 64;
+    static constexpr uint32_t tcp_queue_bytes = KiB(256);
+    static constexpr uint32_t tcp_recv_init_bytes = KiB(64);
+    static constexpr uint32_t tcp_recv_max_bytes = KiB(256);
+    static constexpr uint32_t max_pending_conns = 4;
+    static constexpr uint32_t max_shm_groups = 1;
+    static constexpr uint32_t max_shm_conns_per_group = 4;
+    static constexpr uint32_t max_tcp_groups = 1;
+    static constexpr uint32_t max_tcp_conns_per_group = 4;
+    static constexpr uint32_t poll_batch_size = 64;
+    static constexpr std::chrono::nanoseconds handshake_timeout = std::chrono::seconds(5);
+    static constexpr std::chrono::nanoseconds connection_timeout = std::chrono::seconds(10);
+    static constexpr std::chrono::nanoseconds heartbeat_interval = std::chrono::seconds(3);
 };
 
-struct BenchConf {
-    static constexpr uint32_t NameSize = 16;
-    static constexpr uint32_t ShmQueueSize = MiB(1);
-    static constexpr bool ToLittleEndian = true;
-
-    static constexpr uint32_t MaxNewConnections = 4;
-    static constexpr uint32_t MaxShmGrps = 1;
-    static constexpr uint32_t MaxShmConnsPerGrp = 4;
-    static constexpr uint32_t MaxTcpGrps = 1;
-    static constexpr uint32_t MaxTcpConnsPerGrp = 4;
-
-    static constexpr uint32_t TcpQueueSize = KiB(256);
-    static constexpr uint32_t TcpRecvBufInitSize = KiB(64);
-    static constexpr uint32_t TcpRecvBufMaxSize = KiB(256);
-    static constexpr bool TcpNoDelay = true;
-
-    static constexpr int64_t NewConnectionTimeout = 5'000'000'000LL;
-    static constexpr int64_t ConnectionTimeout = 10'000'000'000LL;
-    static constexpr int64_t HeartBeatInverval = 3'000'000'000LL;
-
-    using LoginUserData = char;
-    using LoginRspUserData = char;
-    using ConnectionUserData = uint64_t;
-};
-
-static_assert(ValidBenchConf<BenchConf>, "BenchConf does not satisfy ValidBenchConf");
-static_assert(SpscQueueLike<SPSCVarQueue<BenchConf::ShmQueueSize>>);
+static_assert(ConfigConcept<BenchConfig>);
 
 inline void bench_check(bool cond,
                         std::string_view expr,
@@ -121,10 +82,11 @@ inline void bench_check(bool cond,
     }
 }
 
-inline int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
+inline uint64_t now_ns_u64() noexcept {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            steady_now().time_since_epoch())
+            .count());
 }
 
 inline void cpu_relax() noexcept {
@@ -161,26 +123,24 @@ inline int current_pid() noexcept {
 #endif
 }
 
-inline void write_seq_payload(MsgHeader* hdr, uint16_t payload_size, uint64_t seq) noexcept {
-    auto bytes = std::span<std::byte>{reinterpret_cast<std::byte*>(hdr + 1), payload_size};
-    auto raw = std::bit_cast<std::array<std::byte, sizeof(uint64_t)>>(seq);
-    std::ranges::copy(raw, bytes.begin());
+inline void write_seq_payload(std::byte* dst, uint64_t seq) noexcept {
+    std::memcpy(dst, &seq, sizeof(seq));
 }
 
-inline uint64_t read_seq_payload(const MsgHeader* hdr) noexcept {
-    auto bytes = std::span<const std::byte>{reinterpret_cast<const std::byte*>(hdr + 1), sizeof(uint64_t)};
-    std::array<std::byte, sizeof(uint64_t)> raw{};
-    std::ranges::copy(bytes, raw.begin());
-    return std::bit_cast<uint64_t>(raw);
+inline uint64_t read_seq_payload(MsgView msg) noexcept {
+    uint64_t seq = 0;
+    std::memcpy(&seq, msg.data(), sizeof(seq));
+    return seq;
 }
 
-struct CleanupGuard {
+struct CleanupGuard
+{
     std::string dir;
     std::vector<std::string> shm_names;
 
     ~CleanupGuard() {
         for (const auto& s : shm_names) {
-            my_shm_unlink(s.c_str());
+            detail::shm_unlink_name(s.c_str());
         }
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
@@ -193,129 +153,97 @@ struct CleanupGuard {
 };
 
 uint16_t pick_unused_port() {
-    tcp_socket_t s = tcp_socket(AF_INET, SOCK_STREAM, 0);
-    bench_check(s != INVALID_TCP_SOCKET, "tcp_socket");
+    detail::socket_t s = detail::create_socket(AF_INET, SOCK_STREAM, 0);
+    bench_check(s != detail::kInvalidSocket, "create_socket");
     struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    addr.sin_port = 0;
-    bench_check(tcp_bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0, "tcp_bind");
+    bench_check(detail::parse_ipv4_endpoint("127.0.0.1", 0, addr), "parse_ipv4_endpoint");
+    bench_check(detail::bind_socket(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0, "bind_socket");
     socklen_t len = sizeof(addr);
     bench_check(::getsockname(s, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0, "getsockname");
     uint16_t port = ntohs(addr.sin_port);
-    tcp_close(s);
+    detail::close_socket(s);
     return port;
 }
 
-class BenchServer : public TcpShmServer<BenchServer, BenchConf> {
-public:
-    BenchServer(const std::string& name, const std::string& dir)
-        : TcpShmServer(name, dir) {}
+struct EchoServerHandler
+{
+    bool batch_stage = false;
 
-    bool StartServer(const char* ip, uint16_t port) { return Start(ip, port); }
-    void StopServer() { Stop(); }
-    void PollCtlOnce(int64_t now) { PollCtl(now); }
-    void PollTcpOnce(int64_t now, int grpid) { PollTcp(now, grpid); }
-    void PollShmOnce(int grpid) { PollShm(grpid); }
-
-    void OnSystemError(const char* msg, int sys_errno) {
-        std::cerr << std::format("[BenchServer] System error: {} (errno={})\n", msg, sys_errno);
-    }
-
-    int OnNewConnection(const struct sockaddr_in& /*addr*/, const LoginMsg* /*login*/, LoginRspMsg* /*rsp*/) {
-        return 0;
-    }
-
-    void OnClientLogon(const struct sockaddr_in& /*addr*/, Connection& /*conn*/) {}
-    void OnClientDisconnected(Connection& /*conn*/, const char* /*reason*/, int /*sys_errno*/) {}
-
-    void OnClientFileError(Connection& /*conn*/, const char* msg, int sys_errno) {
-        std::cerr << std::format("[BenchServer] File error: {} (errno={})\n", msg, sys_errno);
-    }
-
-    void OnSeqNumberMismatch(Connection& /*conn*/,
-                             uint32_t /*la*/, uint32_t /*ls*/, uint32_t /*le*/,
-                             uint32_t /*ra*/, uint32_t /*rs*/, uint32_t /*re*/) {
-        std::cerr << "[BenchServer] Sequence mismatch\n";
-    }
-
-    void OnClientMsg(Connection& conn, MsgHeader* recv_header) {
-        if (recv_header->size < sizeof(MsgHeader)) [[unlikely]] {
-            conn.Pop();
-            return;
+    bool on_message(ShmChannel<BenchConfig>& ch, MsgView msg) {
+        auto tx = ch.try_alloc(msg.type(), msg.payload_size());
+        if (!tx) [[unlikely]] {
+            if (batch_stage) ch.flush();
+            return false;
         }
-        uint16_t payload_sz = static_cast<uint16_t>(recv_header->size - sizeof(MsgHeader));
-        MsgHeader* send_header = conn.Alloc(payload_sz);
-        if (!send_header) [[unlikely]] {
-            // Backpressure: defer Pop() so next Poll re-delivers after client drains replies
-            return;
+        if (msg.payload_size() > 0) [[likely]] {
+            std::memcpy(tx->data(), msg.data(), msg.payload_size());
         }
-        send_header->msg_type = recv_header->msg_type;
-        if (payload_sz > 0) [[likely]] {
-            std::memcpy(send_header + 1, recv_header + 1, payload_sz);
+        if (batch_stage) tx->stage();
+        else tx->commit();
+        return true;
+    }
+
+    bool on_message(TcpChannel<BenchConfig>& ch, MsgView msg) {
+        auto tx = ch.try_alloc(msg.type(), msg.payload_size());
+        if (!tx) [[unlikely]] {
+            ch.flush();
+            return false;
         }
-        conn.Pop();
-        conn.Push();
+        if (msg.payload_size() > 0) [[likely]] {
+            std::memcpy(tx->data(), msg.data(), msg.payload_size());
+        }
+        if (batch_stage) tx->stage();
+        else tx->commit();
+        return true;
     }
 };
 
-class BenchClient : public TcpShmClient<BenchClient, BenchConf> {
-public:
-    BenchClient(const std::string& name, const std::string& dir)
-        : TcpShmClient(name, dir), conn_(GetConnection()) {}
-
-    bool ConnectTo(bool use_shm, const char* ip, uint16_t port) {
-        return Connect(use_shm, ip, port, 0);
+struct BenchClientHandler
+{
+    void on_system_error(Error err) {
+        std::cerr << std::format("[BenchClient] System error: {} (errno={})\n", err.message(), err.sys_errno);
     }
-    void StopClient() { Stop(); }
-    void PollTcpOnce(int64_t now) { PollTcp(now); }
-    void PollShmOnce() { PollShm(); }
-    Connection& Conn() noexcept { return conn_; }
 
-    void ResetCounter() noexcept {
+    void on_login_reject(const detail::LoginRspMsg<BenchConfig>& rsp) {
+        std::cerr << std::format("[BenchClient] Login rejected: {}\n", rsp.error_msg);
+    }
+
+    void on_seq_mismatch(const SeqMismatchInfo&) {
+        std::cerr << "[BenchClient] Sequence mismatch\n";
+    }
+
+    void on_server_msg(MsgView msg) {
+        bench_check(msg.payload_size() >= sizeof(uint64_t), "reply payload size");
+        const uint64_t seq = read_seq_payload(msg);
+        bench_check(seq == expected_seq_, "monotonic echo sequence");
+        ++expected_seq_;
+        recv_count_.fetch_add(1, std::memory_order_release);
+    }
+
+    void reset_counter() noexcept {
         recv_count_.store(0, std::memory_order_relaxed);
         expected_seq_ = 0;
     }
 
-    uint64_t RecvCount() const noexcept {
+    [[nodiscard]] uint64_t recv_count() const noexcept {
         return recv_count_.load(std::memory_order_acquire);
     }
 
-    void OnSystemError(const char* msg, int sys_errno) {
-        std::cerr << std::format("[BenchClient] System error: {} (errno={})\n", msg, sys_errno);
-    }
-
-    void OnLoginReject(const LoginRspMsg* rsp) {
-        std::cerr << std::format("[BenchClient] Login rejected: {}\n", rsp->error_msg);
-    }
-
-    int64_t OnLoginSuccess(const LoginRspMsg* /*rsp*/) { return now_ns(); }
-
-    void OnDisconnected(const char* /*reason*/, int /*sys_errno*/) {}
-
-    void OnSeqNumberMismatch(uint32_t /*la*/, uint32_t /*ls*/, uint32_t /*le*/,
-                             uint32_t /*ra*/, uint32_t /*rs*/, uint32_t /*re*/) {
-        std::cerr << "[BenchClient] Sequence mismatch\n";
-    }
-
-    void OnServerMsg(MsgHeader* header) {
-        bench_check(header->size >= sizeof(MsgHeader) + sizeof(uint64_t), "reply payload size");
-        uint64_t seq = read_seq_payload(header);
-        bench_check(seq == expected_seq_, "monotonic echo sequence");
-        ++expected_seq_;
-        conn_.Pop();
-        recv_count_.fetch_add(1, std::memory_order_release);
-    }
-
 private:
-    Connection& conn_;
     uint64_t expected_seq_ = 0;
     std::atomic<uint64_t> recv_count_{0};
 };
 
-enum class BenchMode { All, Rtt, Throughput, Spsc };
+enum class BenchMode
+{
+    All,
+    Rtt,
+    Throughput,
+    Spsc
+};
 
-struct BenchOptions {
+struct BenchOptions
+{
     BenchMode mode = BenchMode::All;
     uint32_t iters = 50'000;
     uint32_t warmup = 2'000;
@@ -324,7 +252,8 @@ struct BenchOptions {
     int pin_client = -1;
 };
 
-struct LatencyStats {
+struct LatencyStats
+{
     uint64_t avg_ns = 0;
     uint64_t min_ns = 0;
     uint64_t p50_ns = 0;
@@ -335,7 +264,8 @@ struct LatencyStats {
     double msg_per_sec = 0.0;
 };
 
-struct ThroughputStats {
+struct ThroughputStats
+{
     double msg_per_sec = 0.0;
     double mb_per_sec = 0.0;
     double ns_per_msg = 0.0;
@@ -367,13 +297,17 @@ LatencyStats compute_latency_stats(std::span<uint64_t> samples_ns, uint64_t tota
 
 std::string make_name(std::string_view prefix, int pid, uint32_t seq) {
     std::string full = std::format("{}{}_{}", prefix, pid % 10000, seq);
-    bench_check(full.size() < BenchConf::NameSize, "name fits within NameSize");
+    bench_check(full.size() < BenchConfig::name_size, "name fits within name_size");
     return full;
 }
 
-template <SpscQueueLike Q>
-ThroughputStats run_spsc_case(uint32_t payload_size, uint32_t warmup, uint32_t iters, int pin_prod, int pin_cons) {
-    auto q = std::make_unique<Q>();
+ThroughputStats run_spsc_case(bool batch_mode,
+                              uint32_t payload_size,
+                              uint32_t warmup,
+                              uint32_t iters,
+                              int pin_prod,
+                              int pin_cons) {
+    auto q = std::make_unique<SpscQueue<BenchConfig::shm_queue_bytes, BenchConfig::shm_block_bytes>>();
     const uint64_t total = static_cast<uint64_t>(warmup) + static_cast<uint64_t>(iters);
     const uint16_t sz = static_cast<uint16_t>(payload_size);
     std::latch ready{2};
@@ -383,17 +317,31 @@ ThroughputStats run_spsc_case(uint32_t payload_size, uint32_t warmup, uint32_t i
         pin_current_thread(pin_cons);
         ready.arrive_and_wait();
         uint64_t expected = 0;
-        while (expected < total) {
-            MsgHeader* hdr = q->Front();
-            if (!hdr) {
-                cpu_relax();
-                continue;
+        if (batch_mode) {
+            while (expected < total) {
+                uint32_t n = q->drain(
+                    [&](MsgView msg) {
+                        bench_check(read_seq_payload(msg) == expected, "spsc batch seq");
+                        ++expected;
+                        if (expected == warmup) {
+                            warmup_end_ns.store(now_ns_u64(), std::memory_order_release);
+                        }
+                    },
+                    32);
+                if (n == 0) cpu_relax();
             }
-            bench_check(read_seq_payload(hdr) == expected, "spsc monotonic seq");
-            q->Pop();
-            ++expected;
-            if (expected == warmup) {
-                warmup_end_ns.store(static_cast<uint64_t>(now_ns()), std::memory_order_release);
+        } else {
+            while (expected < total) {
+                auto rx = q->try_front();
+                if (!rx) {
+                    cpu_relax();
+                    continue;
+                }
+                bench_check(read_seq_payload(rx->view()) == expected, "spsc monotonic seq");
+                ++expected;
+                if (expected == warmup) {
+                    warmup_end_ns.store(now_ns_u64(), std::memory_order_release);
+                }
             }
         }
     });
@@ -401,34 +349,57 @@ ThroughputStats run_spsc_case(uint32_t payload_size, uint32_t warmup, uint32_t i
     std::jthread producer([&](std::stop_token) {
         pin_current_thread(pin_prod);
         ready.arrive_and_wait();
-        for (uint64_t seq = 0; seq < total; ++seq) {
-            MsgHeader* hdr = nullptr;
-            while ((hdr = q->Alloc(sz)) == nullptr) {
-                cpu_relax();
+        if (batch_mode) {
+            constexpr uint32_t kBatch = 32;
+            uint64_t seq = 0;
+            while (seq < total) {
+                uint32_t b = 0;
+                while (seq < total && b < kBatch) {
+                    auto tx = q->try_alloc(1, sz);
+                    if (!tx) {
+                        q->flush();
+                        cpu_relax();
+                        continue;
+                    }
+                    write_seq_payload(tx->data(), seq);
+                    tx->stage();
+                    ++seq;
+                    ++b;
+                }
+                q->flush();
             }
-            hdr->msg_type = 1;
-            write_seq_payload(hdr, sz, seq);
-            q->Push();
+        } else {
+            for (uint64_t seq = 0; seq < total; ++seq) {
+                while (true) {
+                    auto tx = q->try_alloc(1, sz);
+                    if (tx) {
+                        write_seq_payload(tx->data(), seq);
+                        tx->commit();
+                        break;
+                    }
+                    cpu_relax();
+                }
+            }
         }
     });
 
     producer.join();
     consumer.join();
 
-    uint64_t t1 = static_cast<uint64_t>(now_ns());
-    uint64_t t0 = warmup_end_ns.load(std::memory_order_acquire);
-    uint64_t elapsed = (t1 > t0) ? (t1 - t0) : 1u;
-    double sec = static_cast<double>(elapsed) / 1e9;
-    double msg_s = static_cast<double>(iters) / sec;
-    double mb_s = (msg_s * static_cast<double>(payload_size)) / (1024.0 * 1024.0);
+    const uint64_t t1 = now_ns_u64();
+    const uint64_t t0 = warmup_end_ns.load(std::memory_order_acquire);
+    const uint64_t elapsed = (t1 > t0) ? (t1 - t0) : 1u;
+    const double sec = static_cast<double>(elapsed) / 1e9;
+    const double msg_s = static_cast<double>(iters) / sec;
     return ThroughputStats{
         .msg_per_sec = msg_s,
-        .mb_per_sec = mb_s,
+        .mb_per_sec = (msg_s * static_cast<double>(payload_size)) / (1024.0 * 1024.0),
         .ns_per_msg = static_cast<double>(elapsed) / static_cast<double>(iters),
         .elapsed_ns = elapsed,
     };
 }
 
+template<template<uint32_t> class TcpPoller>
 LatencyStats run_rtt_case(const std::string& dir,
                           CleanupGuard& guard,
                           uint32_t run_id,
@@ -444,46 +415,45 @@ LatencyStats run_rtt_case(const std::string& dir,
     if (use_shm) guard.track_pair(srv_name, cli_name);
 
     const uint16_t port = pick_unused_port();
-    BenchServer srv(srv_name, dir);
-    bench_check(srv.StartServer("127.0.0.1", port), "StartServer");
+    EchoServerHandler srv_h;
+    Server<EchoServerHandler, BenchConfig, TcpPoller> srv(srv_h, srv_name, dir);
+    bench_check(srv.start("127.0.0.1", port).has_value(), "server start");
 
     std::latch srv_ready{1};
     std::jthread ctl_thr([&](std::stop_token st) {
         srv_ready.count_down();
         while (!st.stop_requested()) {
-            srv.PollCtlOnce(now_ns());
+            srv.poll_ctl(steady_now());
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     });
     std::jthread worker_thr([&](std::stop_token st) {
         pin_current_thread(pin_server);
         while (!st.stop_requested()) {
-            if (use_shm) {
-                srv.PollShmOnce(0);
-            } else {
-                srv.PollTcpOnce(now_ns(), 0);
-            }
+            if (use_shm) srv.poll_shm(0, 1);
+            else srv.poll_tcp(steady_now(), 0, 1);
             cpu_relax();
         }
     });
     srv_ready.wait();
 
-    BenchClient cli(cli_name, dir);
-    bench_check(cli.ConnectTo(use_shm, "127.0.0.1", port), "ConnectTo");
+    BenchClientHandler cli_h;
+    Client<BenchClientHandler, BenchConfig> cli(cli_h, cli_name, dir);
+    bench_check(cli.connect(use_shm ? TransportKind::Shm : TransportKind::Tcp, "127.0.0.1", port).has_value(),
+                "client connect");
 
-    // In SHM mode, PollTcp runs on a separate thread solely for heartbeats / disconnect checks.
     std::jthread cli_hb_thr;
     if (use_shm) {
         cli_hb_thr = std::jthread([&](std::stop_token st) {
-            while (!st.stop_requested() && !cli.Conn().IsClosed()) {
-                cli.PollTcpOnce(now_ns());
+            while (!st.stop_requested() && !cli.is_closed()) {
+                cli.poll_tcp(steady_now());
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         });
     }
 
     pin_current_thread(pin_client);
-    cli.ResetCounter();
+    cli_h.reset_counter();
 
     const uint16_t sz = static_cast<uint16_t>(payload_size);
     const uint64_t total = static_cast<uint64_t>(warmup) + static_cast<uint64_t>(iters);
@@ -491,28 +461,32 @@ LatencyStats run_rtt_case(const std::string& dir,
     uint64_t measured_ns = 0;
 
     for (uint64_t seq = 0; seq < total; ++seq) {
-        const auto t_start = std::chrono::steady_clock::now();
-        MsgHeader* hdr = nullptr;
-        while ((hdr = cli.Conn().Alloc(sz)) == nullptr) {
-            bench_check(!cli.Conn().IsClosed(), "client closed during Alloc");
-            if (use_shm) cli.PollShmOnce();
-            else cli.PollTcpOnce(now_ns());
-            cpu_relax();
-        }
-        hdr->msg_type = 1;
-        write_seq_payload(hdr, sz, seq);
-        cli.Conn().Push();
+        const auto t_start = steady_now();
+        cli.with_channel([&](auto& ch) {
+            while (true) {
+                auto tx = ch.try_alloc(1, sz);
+                if (tx) {
+                    write_seq_payload(tx->data(), seq);
+                    tx->commit();
+                    break;
+                }
+                bench_check(!cli.is_closed(), "client closed during try_alloc");
+                if (use_shm) cli.poll_shm(1);
+                else cli.poll_tcp(steady_now(), 1);
+                cpu_relax();
+            }
+        });
 
         const uint64_t target = seq + 1;
-        while (cli.RecvCount() < target) {
-            bench_check(!cli.Conn().IsClosed(), "client closed waiting for echo");
-            if (use_shm) cli.PollShmOnce();
-            else cli.PollTcpOnce(now_ns());
+        while (cli_h.recv_count() < target) {
+            bench_check(!cli.is_closed(), "client closed waiting for echo");
+            if (use_shm) cli.poll_shm(1);
+            else cli.poll_tcp(steady_now(), 1);
             cpu_relax();
         }
-        const auto t_end = std::chrono::steady_clock::now();
+        const auto t_end = steady_now();
         if (seq >= warmup) {
-            uint64_t rtt = static_cast<uint64_t>(
+            const uint64_t rtt = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count());
             samples_ns[seq - warmup] = rtt;
             measured_ns += rtt;
@@ -523,20 +497,22 @@ LatencyStats run_rtt_case(const std::string& dir,
         cli_hb_thr.request_stop();
         cli_hb_thr.join();
     }
-    cli.StopClient();
+    cli.stop();
     worker_thr.request_stop();
     ctl_thr.request_stop();
     worker_thr.join();
     ctl_thr.join();
-    srv.StopServer();
+    srv.stop();
 
     return compute_latency_stats(samples_ns, measured_ns);
 }
 
+template<template<uint32_t> class TcpPoller>
 ThroughputStats run_throughput_case(const std::string& dir,
                                     CleanupGuard& guard,
                                     uint32_t run_id,
                                     bool use_shm,
+                                    bool batch_mode,
                                     uint32_t payload_size,
                                     uint32_t warmup,
                                     uint32_t iters,
@@ -548,68 +524,101 @@ ThroughputStats run_throughput_case(const std::string& dir,
     if (use_shm) guard.track_pair(srv_name, cli_name);
 
     const uint16_t port = pick_unused_port();
-    BenchServer srv(srv_name, dir);
-    bench_check(srv.StartServer("127.0.0.1", port), "StartServer");
+    EchoServerHandler srv_h;
+    srv_h.batch_stage = batch_mode;
+    Server<EchoServerHandler, BenchConfig, TcpPoller> srv(srv_h, srv_name, dir);
+    bench_check(srv.start("127.0.0.1", port).has_value(), "server start");
 
     std::latch srv_ready{1};
     std::jthread ctl_thr([&](std::stop_token st) {
         srv_ready.count_down();
         while (!st.stop_requested()) {
-            srv.PollCtlOnce(now_ns());
+            srv.poll_ctl(steady_now());
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     });
     std::jthread worker_thr([&](std::stop_token st) {
         pin_current_thread(pin_server);
+        const uint32_t batch_lim = batch_mode ? 32u : 1u;
         while (!st.stop_requested()) {
-            if (use_shm) srv.PollShmOnce(0);
-            else srv.PollTcpOnce(now_ns(), 0);
+            if (use_shm) {
+                srv.poll_shm(0, batch_lim);
+            } else {
+                srv.poll_tcp(steady_now(), 0, batch_lim);
+            }
             cpu_relax();
         }
     });
     srv_ready.wait();
 
-    BenchClient cli(cli_name, dir);
-    bench_check(cli.ConnectTo(use_shm, "127.0.0.1", port), "ConnectTo");
-    cli.ResetCounter();
+    BenchClientHandler cli_h;
+    Client<BenchClientHandler, BenchConfig> cli(cli_h, cli_name, dir);
+    bench_check(cli.connect(use_shm ? TransportKind::Shm : TransportKind::Tcp, "127.0.0.1", port).has_value(),
+                "client connect");
+    cli_h.reset_counter();
 
     const uint16_t sz = static_cast<uint16_t>(payload_size);
     const uint64_t total = static_cast<uint64_t>(warmup) + static_cast<uint64_t>(iters);
-    std::atomic<int64_t> measure_start_ns{0};
-    int64_t measure_end_ns = 0;
+    std::atomic<uint64_t> measure_start_ns{0};
+    uint64_t measure_end_ns = 0;
 
     if (use_shm) {
         std::latch start_gate{2};
         std::jthread hb_thr([&](std::stop_token st) {
-            while (!st.stop_requested() && !cli.Conn().IsClosed()) {
-                cli.PollTcpOnce(now_ns());
+            while (!st.stop_requested() && !cli.is_closed()) {
+                cli.poll_tcp(steady_now());
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         });
         std::jthread recv_thr([&](std::stop_token) {
             start_gate.arrive_and_wait();
-            while (cli.RecvCount() < total) {
-                bench_check(!cli.Conn().IsClosed(), "SHM client closed in throughput recv");
-                cli.PollShmOnce();
-                if (measure_start_ns.load(std::memory_order_acquire) == 0 && cli.RecvCount() >= warmup) {
-                    measure_start_ns.store(now_ns(), std::memory_order_release);
+            const uint32_t rx_batch = batch_mode ? 32u : 1u;
+            while (cli_h.recv_count() < total) {
+                bench_check(!cli.is_closed(), "SHM client closed in throughput recv");
+                cli.poll_shm(rx_batch);
+                if (measure_start_ns.load(std::memory_order_acquire) == 0 && cli_h.recv_count() >= warmup) {
+                    measure_start_ns.store(now_ns_u64(), std::memory_order_release);
                 }
                 cpu_relax();
             }
-            measure_end_ns = now_ns();
+            measure_end_ns = now_ns_u64();
         });
         std::jthread send_thr([&](std::stop_token) {
             pin_current_thread(pin_client);
             start_gate.arrive_and_wait();
-            for (uint64_t seq = 0; seq < total; ++seq) {
-                MsgHeader* hdr = nullptr;
-                while ((hdr = cli.Conn().Alloc(sz)) == nullptr) {
-                    bench_check(!cli.Conn().IsClosed(), "SHM client closed in throughput Alloc");
-                    cpu_relax();
+            auto& ch = cli.shm_channel();
+            if (batch_mode) {
+                uint64_t seq = 0;
+                while (seq < total) {
+                    uint32_t b = 0;
+                    while (seq < total && b < 32u) {
+                        auto tx = ch.try_alloc(1, sz);
+                        if (!tx) {
+                            bench_check(!cli.is_closed(), "SHM client closed in throughput try_alloc");
+                            ch.flush();
+                            cpu_relax();
+                            continue;
+                        }
+                        write_seq_payload(tx->data(), seq);
+                        tx->stage();
+                        ++seq;
+                        ++b;
+                    }
+                    ch.flush();
                 }
-                hdr->msg_type = 1;
-                write_seq_payload(hdr, sz, seq);
-                cli.Conn().Push();
+            } else {
+                for (uint64_t seq = 0; seq < total; ++seq) {
+                    while (true) {
+                        auto tx = ch.try_alloc(1, sz);
+                        if (tx) {
+                            write_seq_payload(tx->data(), seq);
+                            tx->commit();
+                            break;
+                        }
+                        bench_check(!cli.is_closed(), "SHM client closed in throughput try_alloc");
+                        cpu_relax();
+                    }
+                }
             }
         });
         send_thr.join();
@@ -618,51 +627,46 @@ ThroughputStats run_throughput_case(const std::string& dir,
         hb_thr.join();
     } else {
         pin_current_thread(pin_client);
+        auto& ch = cli.tcp_channel();
         uint64_t sent = 0;
-        while (cli.RecvCount() < total) {
-            bench_check(!cli.Conn().IsClosed(), "TCP client closed in throughput");
+        while (cli_h.recv_count() < total) {
+            bench_check(!cli.is_closed(), "TCP client closed in throughput");
             uint32_t batch = 0;
             while (sent < total && batch < 32u) {
-                MsgHeader* hdr = cli.Conn().Alloc(sz);
-                if (!hdr) break;
-                hdr->msg_type = 1;
-                write_seq_payload(hdr, sz, sent);
+                auto tx = ch.try_alloc(1, sz);
+                if (!tx) break;
+                write_seq_payload(tx->data(), sent);
                 ++sent;
                 ++batch;
-                if (sent == total || batch == 32u) {
-                    cli.Conn().Push();
-                } else {
-                    cli.Conn().PushMore();
-                }
+                if (sent == total || batch == 32u) tx->commit();
+                else tx->stage();
             }
-            // Drain all currently buffered/available replies so recvbuf_ does not thrash with memmove
             uint64_t prev_recv;
             do {
-                prev_recv = cli.RecvCount();
-                cli.PollTcpOnce(now_ns());
-            } while (cli.RecvCount() > prev_recv && cli.RecvCount() < total);
-            if (measure_start_ns.load(std::memory_order_relaxed) == 0 && cli.RecvCount() >= warmup) {
-                measure_start_ns.store(now_ns(), std::memory_order_relaxed);
+                prev_recv = cli_h.recv_count();
+                cli.poll_tcp(steady_now(), 32u);
+            } while (cli_h.recv_count() > prev_recv && cli_h.recv_count() < total);
+            if (measure_start_ns.load(std::memory_order_relaxed) == 0 && cli_h.recv_count() >= warmup) {
+                measure_start_ns.store(now_ns_u64(), std::memory_order_relaxed);
             }
         }
-        measure_end_ns = now_ns();
+        measure_end_ns = now_ns_u64();
     }
 
-    cli.StopClient();
+    cli.stop();
     worker_thr.request_stop();
     ctl_thr.request_stop();
     worker_thr.join();
     ctl_thr.join();
-    srv.StopServer();
+    srv.stop();
 
-    int64_t t0 = measure_start_ns.load(std::memory_order_acquire);
-    uint64_t elapsed = (measure_end_ns > t0) ? static_cast<uint64_t>(measure_end_ns - t0) : 1u;
-    double sec = static_cast<double>(elapsed) / 1e9;
-    double msg_s = static_cast<double>(iters) / sec;
-    double mb_s = (msg_s * static_cast<double>(payload_size)) / (1024.0 * 1024.0);
+    const uint64_t t0 = measure_start_ns.load(std::memory_order_acquire);
+    const uint64_t elapsed = (measure_end_ns > t0) ? (measure_end_ns - t0) : 1u;
+    const double sec = static_cast<double>(elapsed) / 1e9;
+    const double msg_s = static_cast<double>(iters) / sec;
     return ThroughputStats{
         .msg_per_sec = msg_s,
-        .mb_per_sec = mb_s,
+        .mb_per_sec = (msg_s * static_cast<double>(payload_size)) / (1024.0 * 1024.0),
         .ns_per_msg = static_cast<double>(elapsed) / static_cast<double>(iters),
         .elapsed_ns = elapsed,
     };
@@ -691,7 +695,7 @@ void print_usage(std::string_view prog) {
         "  --pin-client=<core>              Pin client worker thread to CPU core (-1 = unpinned)\n"
         "  --help, -h                       Show this message\n",
         prog,
-        BenchConf::TcpRecvBufMaxSize - sizeof(MsgHeader));
+        BenchConfig::tcp_recv_max_bytes - sizeof(FrameHeader));
 }
 
 bool parse_args(int argc, char** argv, BenchOptions& opts) {
@@ -720,8 +724,8 @@ bool parse_args(int argc, char** argv, BenchOptions& opts) {
                                        static_cast<size_t>(std::ranges::distance(part))};
                 uint32_t sz = 0;
                 if (!parse_u32(token, sz) || sz < sizeof(uint64_t) ||
-                    sz > 65535u - sizeof(MsgHeader) ||
-                    sz + sizeof(MsgHeader) > BenchConf::TcpRecvBufMaxSize) {
+                    sz > kMaxPayloadSize ||
+                    sz + sizeof(FrameHeader) > BenchConfig::tcp_recv_max_bytes) {
                     return false;
                 }
                 opts.sizes.push_back(sz);
@@ -748,77 +752,98 @@ int main(int argc, char** argv) {
     }
 
     const std::string dir = (std::filesystem::temp_directory_path() /
-                             std::format("tcpshm_bench_{}", current_pid()))
+                             std::format("tcpshm_v2_bench_{}", current_pid()))
                                 .string();
     CleanupGuard guard{dir, {}};
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
     std::cout << std::format(
-        "tcpshm C++20 Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={})\n",
+        "tcpshm v2.0 C++23 Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={})\n",
         opts.iters,
         opts.warmup,
-        BenchConf::ShmQueueSize / 1024u,
-        BenchConf::TcpQueueSize / 1024u,
+        BenchConfig::shm_queue_bytes / 1024u,
+        BenchConfig::tcp_queue_bytes / 1024u,
         opts.pin_server,
         opts.pin_client);
 
     uint32_t run_id = 1;
 
     if (opts.mode == BenchMode::All || opts.mode == BenchMode::Spsc) {
-        std::cout << "\n[1] SPSCVarQueue Raw SPSC Throughput (2 threads, 1-way)\n";
-        std::cout << std::format("{:<8} {:>14} {:>12} {:>12}\n", "Bytes", "Msg/sec", "MB/sec", "ns/msg");
-        std::cout << std::string(50, '-') << '\n';
+        std::cout << "\n[1] SpscQueue Raw SPSC Throughput (2 threads, 1-way)\n";
+        std::cout << std::format("{:<12} {:<8} {:>14} {:>12} {:>12}\n",
+                                 "Variant", "Bytes", "Msg/sec", "MB/sec", "ns/msg");
+        std::cout << std::string(62, '-') << '\n';
         for (uint32_t sz : opts.sizes) {
-            auto st = run_spsc_case<SPSCVarQueue<BenchConf::ShmQueueSize>>(
-                sz, opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
-            std::cout << std::format("{:<8} {:>14.0f} {:>12.2f} {:>12.1f}\n",
-                                     sz,
-                                     st.msg_per_sec,
-                                     st.mb_per_sec,
-                                     st.ns_per_msg);
+            auto st1 = run_spsc_case(false, sz, opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<12} {:<8} {:>14.0f} {:>12.2f} {:>12.1f}\n",
+                                     "1-by-1", sz, st1.msg_per_sec, st1.mb_per_sec, st1.ns_per_msg);
+
+            auto st_b = run_spsc_case(true, sz, opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<12} {:<8} {:>14.0f} {:>12.2f} {:>12.1f}\n",
+                                     "Batch-32", sz, st_b.msg_per_sec, st_b.mb_per_sec, st_b.ns_per_msg);
         }
     }
 
     if (opts.mode == BenchMode::All || opts.mode == BenchMode::Rtt) {
         std::cout << "\n[2] Ping-Pong Round-Trip Latency (RTT, 1-in-flight)\n";
-        std::cout << std::format("{:<6} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12}\n",
+        std::cout << std::format("{:<10} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12}\n",
                                  "Mode", "Bytes", "Avg(ns)", "Min(ns)", "P50(ns)", "P99(ns)", "P99.9", "Max(ns)", "Msg/sec");
-        std::cout << std::string(88, '-') << '\n';
+        std::cout << std::string(92, '-') << '\n';
         for (uint32_t sz : opts.sizes) {
-            auto tcp = run_rtt_case(dir, guard, run_id++, false, sz, opts.warmup, opts.iters,
-                                    opts.pin_server, opts.pin_client);
-            std::cout << std::format("{:<6} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12.0f}\n",
-                                     "TCP", sz, tcp.avg_ns, tcp.min_ns, tcp.p50_ns, tcp.p99_ns,
-                                     tcp.p999_ns, tcp.max_ns, tcp.msg_per_sec);
+            auto tcp_busy = run_rtt_case<BusyPoller>(dir, guard, run_id++, false, sz,
+                                                     opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<10} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12.0f}\n",
+                                     "TCP-Busy", sz, tcp_busy.avg_ns, tcp_busy.min_ns, tcp_busy.p50_ns,
+                                     tcp_busy.p99_ns, tcp_busy.p999_ns, tcp_busy.max_ns, tcp_busy.msg_per_sec);
 
-            auto shm = run_rtt_case(dir, guard, run_id++, true, sz, opts.warmup, opts.iters,
-                                    opts.pin_server, opts.pin_client);
-            std::cout << std::format("{:<6} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12.0f}\n",
+#ifdef __linux__
+            auto tcp_ep = run_rtt_case<EpollPoller>(dir, guard, run_id++, false, sz,
+                                                    opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<10} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12.0f}\n",
+                                     "TCP-Epoll", sz, tcp_ep.avg_ns, tcp_ep.min_ns, tcp_ep.p50_ns,
+                                     tcp_ep.p99_ns, tcp_ep.p999_ns, tcp_ep.max_ns, tcp_ep.msg_per_sec);
+#endif
+
+            auto shm = run_rtt_case<BusyPoller>(dir, guard, run_id++, true, sz,
+                                                opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<10} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12.0f}\n",
                                      "SHM", sz, shm.avg_ns, shm.min_ns, shm.p50_ns, shm.p99_ns,
                                      shm.p999_ns, shm.max_ns, shm.msg_per_sec);
 
-            double speedup = static_cast<double>(tcp.p50_ns) /
-                             static_cast<double>(std::max<uint64_t>(shm.p50_ns, 1u));
-            std::cout << std::format("  -> {}B P50 RTT speedup (TCP/SHM): {:.2f}x\n", sz, speedup);
+            const double speedup = static_cast<double>(tcp_busy.p50_ns) /
+                                   static_cast<double>(std::max<uint64_t>(shm.p50_ns, 1u));
+            std::cout << std::format("  -> {}B P50 RTT speedup (TCP-Busy/SHM): {:.2f}x\n", sz, speedup);
         }
     }
 
     if (opts.mode == BenchMode::All || opts.mode == BenchMode::Throughput) {
-        std::cout << "\n[3] Pipelined Echo Throughput (unidirectional echo rate)\n";
-        std::cout << std::format("{:<6} {:>7} {:>14} {:>12} {:>12}\n",
+        std::cout << "\n[3] Pipelined Echo Throughput\n";
+        std::cout << std::format("{:<11} {:>7} {:>14} {:>12} {:>12}\n",
                                  "Mode", "Bytes", "Msg/sec", "MB/sec", "ns/msg");
-        std::cout << std::string(55, '-') << '\n';
+        std::cout << std::string(60, '-') << '\n';
         for (uint32_t sz : opts.sizes) {
-            auto tcp = run_throughput_case(dir, guard, run_id++, false, sz, opts.warmup, opts.iters,
-                                           opts.pin_server, opts.pin_client);
-            std::cout << std::format("{:<6} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
-                                     "TCP", sz, tcp.msg_per_sec, tcp.mb_per_sec, tcp.ns_per_msg);
+            auto tcp_busy = run_throughput_case<BusyPoller>(dir, guard, run_id++, false, true, sz,
+                                                            opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
+                                     "TCP-Busy", sz, tcp_busy.msg_per_sec, tcp_busy.mb_per_sec, tcp_busy.ns_per_msg);
 
-            auto shm = run_throughput_case(dir, guard, run_id++, true, sz, opts.warmup, opts.iters,
-                                           opts.pin_server, opts.pin_client);
-            std::cout << std::format("{:<6} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
-                                     "SHM", sz, shm.msg_per_sec, shm.mb_per_sec, shm.ns_per_msg);
+#ifdef __linux__
+            auto tcp_ep = run_throughput_case<EpollPoller>(dir, guard, run_id++, false, true, sz,
+                                                           opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
+                                     "TCP-Epoll", sz, tcp_ep.msg_per_sec, tcp_ep.mb_per_sec, tcp_ep.ns_per_msg);
+#endif
+
+            auto shm_1 = run_throughput_case<BusyPoller>(dir, guard, run_id++, true, false, sz,
+                                                         opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
+                                     "SHM-1by1", sz, shm_1.msg_per_sec, shm_1.mb_per_sec, shm_1.ns_per_msg);
+
+            auto shm_b = run_throughput_case<BusyPoller>(dir, guard, run_id++, true, true, sz,
+                                                         opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+            std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
+                                     "SHM-Batch", sz, shm_b.msg_per_sec, shm_b.mb_per_sec, shm_b.ns_per_msg);
         }
     }
 

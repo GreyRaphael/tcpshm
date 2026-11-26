@@ -64,8 +64,6 @@ template<class Handler,
 class Server
 {
     static_assert(ConfigConcept<Config>, "Config must satisfy ConfigConcept");
-    static_assert(ServerHandlerConcept<Handler, Config>,
-                  "Handler must implement on_message(ShmChannel&, MsgView) and on_message(TcpChannel&, MsgView)");
 public:
     using ShmChannelType = ShmChannel<Config>;
     using TcpChannelType = TcpChannel<Config>;
@@ -104,6 +102,8 @@ public:
     Server& operator=(Server&&) = delete;
 
     [[nodiscard]] VoidResult start(std::string_view listen_ipv4, uint16_t listen_port) noexcept {
+        static_assert(ServerHandlerConcept<Handler, Config>,
+                      "Handler must implement on_message(ShmChannel&, MsgView) and on_message(TcpChannel&, MsgView)");
         if (listenfd_ != detail::kInvalidSocket) {
             Error err{ErrorCode::AlreadyStarted, 0};
             notify_system_error(err);
@@ -286,6 +286,9 @@ public:
                     return dispatch_message(ch, view);
                 },
                 max_batch);
+            if (ch.has_staged()) [[unlikely]] {
+                ch.flush();
+            }
             if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
                 retire_active_shm(grp);
                 return total;

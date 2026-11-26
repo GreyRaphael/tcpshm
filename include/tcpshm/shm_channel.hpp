@@ -41,13 +41,13 @@ SOFTWARE.
 
 namespace tcpshm {
 
-template<class Handler, ConfigConcept Config, template<uint32_t> class TcpPoller>
+template<class Handler, class Config, template<uint32_t> class TcpPoller>
 class Server;
 
-template<class Handler, ConfigConcept Config>
+template<class Handler, class Config>
 class ShmClient;
 
-template<class Handler, ConfigConcept Config>
+template<class Handler, class Config>
 class Client;
 
 // Dedicated shared-memory channel with branchless SPSC queues and a lightweight TCP keepalive socket.
@@ -85,6 +85,7 @@ public:
     }
 
     void flush() noexcept { sendq_.flush(); }
+    [[nodiscard]] bool has_staged() const noexcept { return sendq_.has_staged(); }
 
     [[nodiscard]] auto try_front() noexcept { return recvq_.try_front(); }
 
@@ -111,11 +112,11 @@ public:
     typename Config::ConnectionUserData user_data{};
 
 private:
-    template<class Handler, ConfigConcept Cfg, template<uint32_t> class TcpPoller>
+    template<class Handler, class Cfg, template<uint32_t> class TcpPoller>
     friend class Server;
-    template<class Handler, ConfigConcept Cfg>
+    template<class Handler, class Cfg>
     friend class ShmClient;
-    template<class Handler, ConfigConcept Cfg>
+    template<class Handler, class Cfg>
     friend class Client;
 
     void init(const char* local_name) noexcept {

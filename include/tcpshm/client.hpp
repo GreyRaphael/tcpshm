@@ -351,7 +351,6 @@ template<class Handler, class Config = DefaultConfig>
 class ShmClient
 {
     static_assert(ConfigConcept<Config>, "Config must satisfy ConfigConcept");
-    static_assert(ClientHandlerConcept<Handler>, "Handler must implement on_server_msg(MsgView)");
 public:
     using Channel = ShmChannel<Config>;
     using LoginUserData = typename Config::LoginUserData;
@@ -374,6 +373,7 @@ public:
     [[nodiscard]] VoidResult connect(std::string_view server_ipv4,
                                      uint16_t server_port,
                                      const LoginUserData& login_user_data = {}) noexcept {
+        static_assert(ClientHandlerConcept<Handler>, "Handler must implement on_server_msg(MsgView)");
         if (!channel_.is_closed()) {
             Error err{ErrorCode::AlreadyConnected, 0};
             detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, err);
@@ -458,7 +458,6 @@ template<class Handler, class Config = DefaultConfig>
 class TcpClient
 {
     static_assert(ConfigConcept<Config>, "Config must satisfy ConfigConcept");
-    static_assert(ClientHandlerConcept<Handler>, "Handler must implement on_server_msg(MsgView)");
 public:
     using Channel = TcpChannel<Config>;
     using LoginUserData = typename Config::LoginUserData;
@@ -481,6 +480,7 @@ public:
     [[nodiscard]] VoidResult connect(std::string_view server_ipv4,
                                      uint16_t server_port,
                                      const LoginUserData& login_user_data = {}) noexcept {
+        static_assert(ClientHandlerConcept<Handler>, "Handler must implement on_server_msg(MsgView)");
         if (!channel_.is_closed()) {
             Error err{ErrorCode::AlreadyConnected, 0};
             detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, err);
@@ -593,7 +593,6 @@ template<class Handler, class Config = DefaultConfig>
 class Client
 {
     static_assert(ConfigConcept<Config>, "Config must satisfy ConfigConcept");
-    static_assert(ClientHandlerConcept<Handler>, "Handler must implement on_server_msg(MsgView)");
 public:
     using ShmChannelType = ShmChannel<Config>;
     using TcpChannelType = TcpChannel<Config>;
@@ -619,6 +618,7 @@ public:
                                      std::string_view server_ipv4,
                                      uint16_t server_port,
                                      const LoginUserData& login_user_data = {}) noexcept {
+        static_assert(ClientHandlerConcept<Handler>, "Handler must implement on_server_msg(MsgView)");
         if (!shm_ch_.is_closed() || !tcp_ch_.is_closed()) {
             Error err{ErrorCode::AlreadyConnected, 0};
             detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, err);

@@ -1,392 +1,142 @@
 [English](interface.md) | [中文](interface-CN.md)
 
-tcpshm 接口与开发指南 (C++20)
-==============================
+# tcpshm v2 接口与开发指南 (C++23)
 
-`tcpshm` 是一个采用现代 C++（**C++20**，兼容 C++23）编写的高性能、面向连接的持久化消息队列通信框架，全面支持 **Linux 与 Windows** 跨平台部署。
-
-## MsgHeader 消息头部与保留消息类型
-
-无论控制消息还是业务应用消息，每一条在 `tcpshm` 中传输的消息包都会自动由框架在最前方附加一个 8 字节对齐 (`alignas(8)`) 的 `MsgHeader`（以当前主机的本地字节序存储）：
-
-```c++
-struct alignas(8) MsgHeader
-{
-    // 当前消息包的总字节大小（包含 MsgHeader 自身 8 字节在内，最大 65535）
-    // 由底层 Alloc() 自动设置，应用端可直接读取
-    uint16_t size;
-    // 业务层自定义的应用消息类型 ID（必须由用户在 Alloc() 后自行设置，且严禁为 0）
-    uint16_t msg_type;
-    // 内部用于 PTCP 序列号与 ACK 对齐应答的字段，严禁业务层篡改
-    uint32_t ack_seq;
-
-    template<bool ToLittle>
-    void ConvertByteOrder();
-};
-```
-
-当通过 TCP 网络通道发送数据时，框架会在底层按照 `ToLittleEndian` 配置利用 `std::endian` 自动对 `MsgHeader` 进行字节序转换。
-
-### 内部保留的 `msg_type` ID 说明
-在业务侧定义自己的协议消息 `msg_type` 时，请务必注意以下由框架内部保留或特定阶段占用的 ID：
-* `0`: `HeartbeatMsg`（底层心跳包，在连接空闲时用于双向探测与保活）。**业务应用消息严禁使用 `msg_type = 0`**，因为 `PTCPConnection::Front()` 会将 `msg_type == 0` 视作内部心跳包静默消费掉（若 `size != sizeof(MsgHeader)` 更会直接断开连接）。
-* `3`: `ShmProbeReqMsg`（SHM 握手探测请求包，由服务端发出以验证对共享内存的物理访问权限）。
-* `4`: `ShmProbeRspMsg`（SHM 握手探测响应包，由客户端验证成功后回发）。
-* `1` & `2`: `LoginMsg` (`msg_type=1`) 和 `LoginRspMsg` (`msg_type=2`)。仅在初次建立连接登录协商阶段被占用。**一旦登录握手成功完成（触发了 `OnLoginSuccess` / `OnClientLogon` 回调后），业务应用即可安全、自由地复用 `msg_type = 1` 与 `msg_type = 2` 作为普通业务消息 ID。**
+`tcpshm` v2 是基于 **C++23** 实现的纯头文件 IPC 与持久化 TCP 消息队列框架，支持 **Linux 与 Windows**。
 
 ---
 
-## TcpShmConnection 核心连接类
+## 1. 帧协议与零开销 RAII API (`frame.hpp`)
 
-`TcpShmConnection` 是对底层的 TCP 传输通道 (`PTCPConnection`) 或共享内存通道 (`SPSCVarQueue`) 的统一抽象连接类。
+### 8 字节极简 `FrameHeader`
+每条消息均携带紧凑的 8 字节 `alignas(8)` 帧头，总长度上限 `65535` 字节（单包有效载荷上限 `kMaxPayloadSize = 65527` 字节）：
 
-**核心注意事项：对同一条连接上所有的读写调用（如 `Alloc/Push` 与 `Front/Pop`），必须严格限制在同一个绑定它的轮询线程内部发生。**
-
-### 发送消息 (Sending Messages)
-要发送一条消息，首先通过调用 `Alloc()` 在发件队列中申请一段指定字节大小的内存空间：
-
-```c++
-// 在发送缓冲区分配指定大小的消息空间（传参 payload 大小即可，不含 MsgHeader；最大 65535 - sizeof(MsgHeader) = 65527 字节）
-// 返回的地址保证严格 8 字节对齐
-// 如果当前缓冲队列已满、剩余空间不足或 size > 65527，将返回 nullptr
-MsgHeader* Alloc(uint16_t size);
-```
-
-在获取到返回的 `MsgHeader* header` 成功指针后，你需要在其上显式赋予非零的 `header->msg_type` 业务类型 (`msg_type != 0`)，并将实际的业务负载（例如 C/C++ POD 结构体或序列化后的 Protobuf/JSON 字节流）精准拷贝进紧随头部之后的地址空间 (`header + 1`)。完成填充后，调用 `Push()` 或 `PushMore()` 提交并发往对端：
-
-```c++
-// 提交刚才 Alloc() 的最后一条消息并立刻触发发送处理
-void Push();
-
-// 针对 SHM 模式：该调用与 Push() 完全等价
-// 针对 TCP 模式：将数据推入缓冲区但在本次调用中不立即冲刷发往网络端（常用于多条消息连续批量发送的场景）
-void PushMore();
-```
-
-### 接收消息 (Receiving Messages)
-当应用层的轮询函数 (`PollTcp` / `PollShm`) 探测到有新包到达时，会自动调用你所提供的 `OnServerMsg` 或 `OnClientMsg` 回调方法。在你的业务回调方法内部，通过 `Front()` 取得当前首条消息，并在处理结束后调用 `Pop()` 予以消费出队：
-
-```c++
-// 获取接收缓冲队列中的当前首条待处理业务消息；若队列为空则返回 nullptr
-// 返回的消息指针保证 8 字节对齐
-MsgHeader* Front();
-
-// 标记消费出队 Front() 所指向的当前首条业务消息
-void Pop();
-```
-
-> **🔥 Request-Response 模式下的核心最佳实践：**  
-> 当业务对 `Front()` 返回的消息处理完毕、并想要马上向对端回覆一条应答响应包时，**强烈建议先调用 `Pop()`，然后再调用 `Alloc()/Push()`**：
-> 1. 在 TCP 传输模式下，`Push()` 内部会立刻尝试将数据发送至系统套接字。先执行 `Pop()` 可以将最新的对端确认序列号 (`ack_seq`) 直接捎带（Piggyback）在即将发出的应答包中，极大提升网络确认与吞吐效率。
-> 2. 如果程序在 `Pop()` 和 `Push()` 之间发生突发宕机崩溃，当前收到的消息已明确被标记为确认消费。当进程重启进行自动从底层 `.ptcp` / `.shm` 恢复时，避免了对同一条消息再次去重发应答，保障了业务幂等性。
-
-### 连接元数据与管理 (Connection Metadata & Control)
-你可以在业务生命周期的任意时刻通过 `TcpShmConnection` 查询当前连接状态或执行断连：
-
-```c++
-// 判断底层 TCP 套接字或共享内存连接是否已经断开
-bool IsClosed();
-
-// 向底层的控制逻辑发出主动断开本连接的请求
-void Close();
-
-// 获取当前连接断开的原因描述字符串及底层系统 errno 错误码
-const char* GetCloseReason(int* sys_errno);
-
-// 获取对端与本地的会话名称
-char* GetRemoteName();
-const char* GetLocalName();
-
-// 获取持久化文件 (.ptcp / .shm) 存放的根目录路径及本连接的 ptcp 文件全名
-const char* GetPtcpDir();
-std::string GetPtcpFile();
-```
-
-在实际编写业务逻辑时，开发者不允许手动直接实例化 `TcpShmConnection` 对象；你应该从客户端的 `GetConnection()` 接口、或者从服务端的 `OnClientLogon / OnClientMsg` 回调传参中提取并持有该连接的引用。
-
----
-
-## 全局配置模板类 (`Conf`)
-
-客户端与服务端均依赖一个静态配置类 (`Conf` 或继承自 `CommonConf`) 来定义会话命名限制、内存大小、延迟心跳、分片分组及业务自定义关联字段（下方标出的 6 个服务端专用配置项为 `TcpShmServer` 必需，纯客户端配置可按需省略）：
-
-```c++
-struct Conf
-{
-    // 会话名称最大字符数（包含结尾的 '\0'，默认为 16）
-    static constexpr uint32_t NameSize = 16;
-
-    // 共享内存环形队列缓冲区大小（单位字节，必须是 64 的倍数且 ShmQueueSize / 64 为 2 的幂次方，如 1MB）
-    static constexpr uint32_t ShmQueueSize = 1024 * 1024;
-
-    // 当前架构主导端大小端配置（对于 x86/x64 主机通常设为 true 即小端序）
-    static constexpr bool ToLittleEndian = true;
-
-    // TCP 发送队列缓冲空间大小（必须是 8 的正整数倍）
-    static constexpr uint32_t TcpQueueSize = 3000;
-
-    // TCP 接收缓冲池的初始分配大小与最大动态扩容大小（必须是 8 的倍数且 TcpRecvBufMaxSize >= TcpRecvBufInitSize）
-    static constexpr uint32_t TcpRecvBufInitSize = 1000;
-    static constexpr uint32_t TcpRecvBufMaxSize = 2000;
-
-    // 是否开启 TCP_NODELAY 选项（禁用 Nagle 算法降低延迟）
-    static constexpr bool TcpNoDelay = true;
-
-    // 连接超时判断与心跳发包的时间间隔阈值（基于用户传入的时间戳单位，如纳秒）
-    // 注意：请保持字段原名 `HeartBeatInverval` 拼写不变
-    static constexpr int64_t ConnectionTimeout = 10LL * 1000000000LL;
-    static constexpr int64_t HeartBeatInverval = 3LL * 1000000000LL;
-
-    // 附着在 LoginMsg / LoginRspMsg / TcpShmConnection 上的业务拓展数据类型
-    using LoginUserData = char;
-    using LoginRspUserData = char;
-    using ConnectionUserData = char;
-
-    // --- 服务端专用配置项（TcpShmServer 必需） ---
-    // PollCtl 中同时允许处于登录握手阶段的最大未决连接数
-    static constexpr uint32_t MaxNewConnections = 5;
-    // 登录握手超时阈值（基于用户传入的时间戳单位，如纳秒）
-    static constexpr int64_t NewConnectionTimeout = 3LL * 1000000000LL;
-    // SHM 连接分组数量与每个 SHM 分组允许的最大连接数
-    static constexpr uint32_t MaxShmGrps = 1;
-    static constexpr uint32_t MaxShmConnsPerGrp = 4;
-    // TCP 连接分组数量与每个 TCP 分组允许的最大连接数
-    static constexpr uint32_t MaxTcpGrps = 1;
-    static constexpr uint32_t MaxTcpConnsPerGrp = 4;
+```cpp
+struct alignas(8) FrameHeader {
+    uint16_t size;     // 消息总字节大小（含 8B 帧头）
+    uint16_t msg_type; // 应用消息类型 ID（0 为底层心跳保留）
+    uint32_t ack_seq;  // PTCP ACK 序列号，或本地 SPSC 队列元数据
 };
 ```
 
----
+> **`msg_type` 保留值说明**：
+> * `0` (`kHeartbeatMsgType`)：TCP 底层心跳保活帧，应用层消息严禁使用 `msg_type == 0`。
+> * `1..4` 在 TCP 登录握手期间内部使用；连接建立完成（触发 `on_login_success` / `on_client_logon`）后，业务层可自由复用 `msg_type >= 1`。
 
-## 客户端开发指南 (`TcpShmClient`)
+### 使用 `WriteGuard` 安全发送
+通过 `ch.try_alloc(msg_type, payload_len)` 获取 `std::optional<WriteGuard<...>>`：
 
-要构建自定义客户端，继承自 `TcpShmClient<MyClient, Conf>` 并在你的类中直接定义**公开 (`public`)** 的回调处理函数。注意构造函数参数顺序为 `(name, ptcp_dir)`，且 `client_name` 须为非空可打印 ASCII 字符，不可包含 `/`、`\`、`..` 且不得与 `server_name` 相同：
-
-```c++
-#include "tcpshm/tcpshm_client.h"
-
-class MyClient : public tcpshm::TcpShmClient<MyClient, Conf>
-{
-public:
-    MyClient(const std::string& name, const std::string& ptcp_dir)
-        : TcpShmClient(name, ptcp_dir), conn_(GetConnection()) {}
-
-    // --- Public 业务与事件回调函数 ---
-
-    void OnSystemError(const char* error_msg, int sys_errno) {
-        std::cout << "系统底层错误: " << error_msg << " 错误码: " << sys_errno << std::endl;
-    }
-
-    void OnLoginReject(const LoginRspMsg* login_rsp) {
-        std::cout << "登录被服务端拒绝: " << login_rsp->error_msg << std::endl;
-    }
-
-    int64_t OnLoginSuccess(const LoginRspMsg* login_rsp) {
-        std::cout << "登录成功！当前对接服务端: " << login_rsp->server_name << std::endl;
-        return get_timestamp(); // 返回当前系统的真实纳秒时间戳
-    }
-
-    void OnServerMsg(MsgHeader* header) {
-        // 解析处理位于 header + 1 处的业务消息体
-        conn_.Pop();
-    }
-
-    void OnDisconnected(const char* reason, int sys_errno) {
-        std::cout << "连接已断开: " << reason << std::endl;
-    }
-
-    void OnSeqNumberMismatch(uint32_t local_ack, uint32_t local_start, uint32_t local_end,
-                             uint32_t remote_ack, uint32_t remote_start, uint32_t remote_end) {
-        std::cout << "检测到通信序列号与对端不匹配，需干预修复。" << std::endl;
-    }
-
-    // --- 客户端控制循环方法示例 ---
-
-    void Run(const char* server_ip, uint16_t port, bool use_shm) {
-        if (!Connect(use_shm, server_ip, port, 0)) return;
-
-        // 在连接未断开的生命周期中持续轮询收包
-        // 若需从独立发送线程写 TCP 连接，需与 PollTcp 互斥同步；SHM 模式收发队列相互独立可无锁并发（参见 client.cpp）
-        while (!conn_.IsClosed()) {
-            if (use_shm) PollShm();
-            PollTcp(get_timestamp());
-            std::this_thread::sleep_for(std::chrono::microseconds(100)); // 避免纯忙轮询消耗 100% CPU
-        }
-        Stop();
-    }
-
-private:
-    Connection& conn_;
-};
-```
-
-### 客户端核心方法清单
-* `bool Connect(bool use_shm, const char* server_ipv4, uint16_t server_port, const LoginUserData& login_user_data)`：向服务端发起 TCP 连接。如传参 `use_shm=true`，会在登录过程中自动完成物理内存探测握手。
-* `Connection& GetConnection()`：获取当前客户端所包装的持久化通信连接引用。
-* `void PollTcp(int64_t now)`：轮询并处理 TCP 通道数据、底层心跳 ping/pong 及异常断线检测。**即便你工作在 SHM 模式下，也一定要在循环中定期调用 `PollTcp()` 以维持 TCP 保活与控制。**
-* `void PollShm()`：轮询并收取无锁物理共享内存环形队列中的最新业务数据。
-* `void Stop()`：安全退出并关闭所有底层句柄和映射文件。
-
----
-
-## 服务端开发指南 (`TcpShmServer`)
-
-要构建自定义服务端，继承自 `TcpShmServer<MyServer, Conf>` 并在派生类中定义**公开 (`public`)** 的回调处理函数。注意构造函数参数顺序为 `(name, ptcp_dir)`：
-
-```c++
-#include "tcpshm/tcpshm_server.h"
-
-class MyServer : public tcpshm::TcpShmServer<MyServer, Conf>
-{
-public:
-    MyServer(const std::string& name, const std::string& ptcp_dir)
-        : TcpShmServer(name, ptcp_dir) {}
-
-    // --- Public 业务与事件回调函数 ---
-
-    void OnSystemError(const char* errno_msg, int sys_errno) {
-        std::cout << "服务端系统底层错误: " << errno_msg << std::endl;
-    }
-
-    int OnNewConnection(const struct sockaddr_in& addr, const LoginMsg* login, LoginRspMsg* login_rsp) {
-        std::cout << "新连接请求: " << login->client_name << " 期望开启 SHM: " << (bool)login->use_shm << std::endl;
-        // 返回分配该客户端的目标线程分组 ID（use_shm 时为 0 到 MaxShmGrps-1，TCP 时为 0 到 MaxTcpGrps-1）
-        // 返回 -1 表示拒绝该次登录请求（越界分组 ID 同样会被拒绝），并可在 login_rsp->error_msg 中设置拒绝说明
-        return 0;
-    }
-
-    void OnClientLogon(const struct sockaddr_in& addr, Connection& conn) {
-        std::cout << "客户端登录成功: " << conn.GetRemoteName() << std::endl;
-    }
-
-    void OnClientDisconnected(Connection& conn, const char* reason, int sys_errno) {
-        std::cout << "客户端断开: " << conn.GetRemoteName() << " 原因: " << reason << std::endl;
-    }
-
-    void OnClientMsg(Connection& conn, MsgHeader* recv_header) {
-        // 读取并处理位于 recv_header + 1 的业务消息体内容
-        conn.Pop();
-    }
-
-    void OnClientFileError(Connection& conn, const char* reason, int sys_errno) {
-        std::cout << "映射或操作队列文件错误 [" << conn.GetRemoteName() << "]: " << reason << std::endl;
-    }
-
-    void OnSeqNumberMismatch(Connection& conn, uint32_t local_ack, uint32_t local_start, uint32_t local_end,
-                             uint32_t remote_ack, uint32_t remote_start, uint32_t remote_end) {}
-};
-```
-
-### 服务端线程模型与分片轮询 (`Polling Model`)
-服务端提供灵活的连接分片设计（Connection Sharding）。底层在登录阶段会根据客户端 `login->use_shm` 与 `OnNewConnection()` 返回的 `grpid` 自动完成路由：
-* **TCP 客户端 (`use_shm = false`)**：进入对应分组的 `PollTcp(now, grpid)`（负责收发、心跳与断线检测，不会进入 `PollShm`）。
-* **SHM 客户端 (`use_shm = true`)**：业务消息（`OnClientMsg`）仅进入对应分组的 `PollShm(grpid)`（不会进入 `PollTcp`），其保活用的 TCP 心跳由 `PollCtl(now)` 顺带轮询。
-* **控制面事件**：`OnNewConnection`、`OnClientLogon` 与 `OnClientDisconnected` 始终只在 `PollCtl(now)` 线程上执行。
-
-```c++
-// 绑定 IP 和端口并启动监听
-bool Start(const char* listen_ipv4, uint16_t listen_port);
-
-// 主控制线程轮询：处理 accept 新连接、执行 SHM 探测握手验证、SHM 连接 TCP 心跳及清理已退出连接
-void PollCtl(int64_t now);
-
-// 业务线程轮询指定的 TCP 连接组 ID (0 <= grpid < MaxTcpGrps)
-void PollTcp(int64_t now, int grpid);
-
-// 业务线程轮询指定的 SHM 共享内存连接组 ID (0 <= grpid < MaxShmGrps)
-void PollShm(int grpid);
-
-// 停止监听并安全释放所有在线连接
-void Stop();
-```
-
-#### 模式 1：简单主线程单循环轮询（Single-Thread Polling）
-* **适用场景**：开发测试、单机轻量服务、连接数很少且不介意新连接握手（`accept` / `mmap` / `VerifyShmProbe` 最长 300ms 阻塞探测）引起短暂延迟抖动的场景。
-* **特点**：零多线程开销、逻辑最简单、所有回调均在同一主线程顺序执行。
-
-```c++
-void RunSingleThread(const char* ip, uint16_t port, std::atomic<bool>& running) {
-    if (!Start(ip, port)) return;
-
-    while (running.load(std::memory_order_acquire)) {
-        int64_t ts = get_timestamp();
-        for (int i = 0; i < static_cast<int>(Conf::MaxTcpGrps); ++i) PollTcp(ts, i);
-        for (int i = 0; i < static_cast<int>(Conf::MaxShmGrps); ++i) PollShm(i);
-        PollCtl(ts);
-        std::this_thread::yield(); // 非极致延迟场景可改为微秒级 sleep_for
-    }
-    Stop();
+```cpp
+// 单条立即发送：
+if (auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, payload_len)) {
+    tx->write_str(data);       // 也支持 write_pod(pod)、emplace<T>(...)、write_bytes(span)
+    tx->commit();              // 立即提交并刷出
 }
-```
 
-#### 模式 2：多线程分片轮询（Multi-Thread Sharded Polling，低延迟/生产推荐）
-* **适用场景**：高频交易（HFT）或低延迟生产环境，多分组高吞吐并发。
-* **特点**：
-  1. 将可能阻塞或进内核的操作（`PollCtl` 的 `accept` / `mmap` / 阻塞式 `VerifyShmProbe`，以及 `PollTcp` 的 socket I/O）与纯用户态亚微秒级 `PollShm` 热路径彻底隔离。
-  2. 可对每个分组线程单独绑核（CPU pinning）实现多核横向扩展。
-  3. 同步应答参考 [`server.cpp`](../server.cpp)；若需 I/O 线程与外部业务线程无锁解耦，参考 [`server_async.cpp`](../server_async.cpp)。
-
-```c++
-void RunMultiThread(const char* ip, uint16_t port, std::atomic<bool>& running) {
-    if (!Start(ip, port)) return;
-
-    std::vector<std::thread> workers;
-    workers.reserve(Conf::MaxTcpGrps + Conf::MaxShmGrps);
-
-    // TCP 工作线程：独占服务对应 grpid 的全部 TCP 客户端
-    for (int i = 0; i < static_cast<int>(Conf::MaxTcpGrps); ++i) {
-        workers.emplace_back([this, &running, grpid = i]() {
-            while (running.load(std::memory_order_acquire)) {
-                PollTcp(get_timestamp(), grpid);
-                std::this_thread::yield();
-            }
-        });
+// 批量流水线发送：
+for (int i = 0; i < 16; ++i) {
+    if (auto tx = ch.try_alloc(1, sizeof(Order))) {
+        tx->emplace<Order>(/* ... */);
+        tx->stage();           // 仅暂存本地批，暂不触发原子 store 或 TCP send()
     }
-
-    // SHM 工作线程：独占服务对应 grpid 的全部 SHM 客户端业务消息
-    for (int i = 0; i < static_cast<int>(Conf::MaxShmGrps); ++i) {
-        workers.emplace_back([this, &running, grpid = i]() {
-            while (running.load(std::memory_order_acquire)) {
-                PollShm(grpid);
-                std::this_thread::yield();
-            }
-        });
-    }
-
-    // 主控制线程：仅处理新连接登录/探测、SHM 连接 TCP 心跳与断线清理
-    while (running.load(std::memory_order_acquire)) {
-        PollCtl(get_timestamp());
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    for (auto& t : workers) {
-        if (t.joinable()) t.join();
-    }
-    Stop();
 }
+ch.flush();                    // 批末一次性原子发布 (SHM) 或单次 syscall 合并发送 (TCP)
 ```
 
----
+若 `WriteGuard` 未调用 `commit()` 或 `stage()` 即离开作用域，析构会自动调用 `cancel()`，杜绝半写帧污染。
 
-## SHM 握手探测底层通信规范 (`use-shm` Probe)
+### 使用 `MsgView` 安全接收
+服务端回调 `on_message(ch, MsgView)` 与客户端回调 `on_server_msg(MsgView)` 直接获得不可变视图 `MsgView`：
 
-当客户端 `login->use_shm == 1` 时，框架严密防范未授权或跨虚拟化的直接打开内存请求，其通信状态机规范如下：
-
-1. **`LoginMsg` 发送 (`msg_type=1`)**：客户端连接 TCP 并在登录包中带上 `use_shm = 1`。
-2. **授权校验、随机 Token 生成与内存文件创建**：在 `OnNewConnection` 授权通过并校验在线客户端名称全局唯一后，服务端执行 `VerifyShmProbe()`，生成防冲突 64 位 Token `MakeShmProbeToken(client_name)` 与单调序号 `seq`，接着以独占模式创建大小为 `sizeof(ShmProbeData)` 的探测共享内存 `/tcpshm_probe_<token>_<seq>`，置入 `token` 及 `ack = 0`。
-3. **`ShmProbeReqMsg` 发出 (`msg_type=3`)**：服务端将带有探测内存名和 `token` 的请求经由 TCP 下发给客户端。
-4. **客户端物理内存映射回写**：客户端仅在 `use_shm == true` 且 `shm_name` 通过 `/tcpshm_probe_` 前缀与路径安全性校验时受理 `ShmProbeReqMsg`，随后严格使用**已存在读写模式（`my_mmap_existing`，可读写但严禁创建权限）**映射该共享内存。当核对物理内存里的 `probe->token == req->token` 成立时，客户端计算应答值 `ack = token ^ 0x5a5a5a5a5a5a5a5aULL`，并**直接将其写回物理共享内存地址处的 `probe->ack` 中**。
-5. **`ShmProbeRspMsg` 应答 (`msg_type=4`)**：客户端通过 TCP 回复应答包确认已经完成计算和回写 (`ok = 1`)。
-6. **服务端双重校验与放行**：服务端确认 TCP 包内 `rsp->ok` 与 `rsp->ack` 匹配后，还要在**本地读取物理内存中的 `probe->ack`**。确认物理内存的确被对方改写成功后，服务端立即销毁并解绑探测文件 (`my_shm_unlink`)，随后按需初始化/打开双向 `SPSCVarQueue` 共享内存缓冲环并发放 `LoginRspMsg (status=0)`。
+* 常用方法：`msg.type()`、`msg.payload_size()`、`msg.payload()` (`std::span<const std::byte>`)、`msg.payload_str()` (`std::string_view`)、`msg.read_as<T>()` (`std::optional<T>`)。
+* 返回 `void`（或返回 `true`）代表消费完成；底层批量 `drain()` 会在整批结束时用单次 `release` 更新 `read_idx`。
+* 若回调返回类型为 `bool` 且返回 `false`，代表**背压拒绝消费**：停止推进该帧，留待下一次轮询重投递。
 
 ---
 
-## 跨平台操作底座与序列化对接
+## 2. 编译期配置与 `ConfigConcept` (`config.hpp`)
 
-### OS 抽象层设计 (`os.h`)
-框架在 `os.h` 中针对跨操作系统网络编程和内存映射提供了透明适配：
-* 在 Windows 上，通过 `ensure_wsa_initialized()` / `WSAInitializer` 自动完成 `WSAStartup / WSACleanup`；利用 `MMapManager` (`get_mmap_manager()`) 管理 `CreateFileMappingA` / `OpenFileMappingA` 与 `MapViewOfFile` 的 Mapping Handle 引用关闭链；将 Linux `readv` 适配为原生高效的 `WSARecv` 聚集读。
-* 在 Linux 上，原生采用 `shm_open`（`0600` 权限，探针额外使用 `O_EXCL`）/ `fstat` 尺寸校验 / `mmap` / `munmap` 内存映射，以及 `fcntl(F_GETFL/F_SETFL)` 非阻塞设置、`EINTR` 重试和 `readv` 分散聚集 IO。
+用户配置只需继承 `tcpshm::DefaultConfig` 并覆盖所需静态常量，框架通过 `ConfigConcept` 在编译期拦截非法配置（如非 2 的幂或未按 8 字节对齐）：
 
-### 零拷贝与现代序列化集成 (`Protobuf` & `std::variant`)
-由于 `conn.Alloc(size)` 直接返回通信对齐缓冲环中紧随 `MsgHeader` 之后 (`header + 1`) 的 8 字节对齐内存指针，固定大小结构体或已知长度的负载可直接原地写入以实现发送端零拷贝。若使用 `iguana::to_pb` 等变长 Protobuf 序列化库，`server.cpp` 与 `client.cpp` 会先序列化到 `std::string` 中间缓冲以获知准确字节长度，再调用 `Alloc(size)` + `memcpy` 写入环形队列；而在收包路径上，则直接通过 `std::string_view` 构建指向 `header + 1` 的零拷贝视图，并利用 `std::variant` + `overload` 实现类型优雅派发。
+```cpp
+struct MyConfig : tcpshm::DefaultConfig {
+    static constexpr uint32_t name_size = 16;
+    static constexpr uint32_t shm_queue_bytes = 1u << 20;      // shm_queue_bytes / shm_block_bytes 须为 2 的幂
+    static constexpr uint32_t shm_block_bytes = 64;            // 须为 8 的 2 次幂倍数
+    static constexpr uint32_t tcp_queue_bytes = 256u << 10;    // 须为 8 的倍数
+    static constexpr uint32_t tcp_recv_init_bytes = 4096;
+    static constexpr uint32_t tcp_recv_max_bytes = 64u << 10;
+    static constexpr uint32_t max_shm_groups = 1;
+    static constexpr uint32_t max_shm_conns_per_group = 4;
+    static constexpr uint32_t max_tcp_groups = 1;
+    static constexpr uint32_t max_tcp_conns_per_group = 16;
+    static constexpr uint32_t max_pending_conns = 16;
+    static constexpr uint32_t poll_batch_size = 64;
+    static constexpr std::endian wire_endian = std::endian::little;
+    static constexpr std::chrono::nanoseconds handshake_timeout = std::chrono::seconds(3);
+    static constexpr std::chrono::nanoseconds connection_timeout = std::chrono::seconds(10);
+    static constexpr std::chrono::nanoseconds heartbeat_interval = std::chrono::seconds(3);
+
+    using LoginUserData = tcpshm::EmptyUserData;
+    using LoginRspUserData = tcpshm::EmptyUserData;
+    using ConnectionUserData = tcpshm::EmptyUserData;
+};
+```
+
+握手阶段会自动校对 `config_fingerprint<Config>()`（涵盖字节序、帧头大小、`name_size`、SHM 布局参数及登录附加数据结构大小），防止服务端与客户端配置错配导致静默数据损坏。
+
+---
+
+## 3. 错误处理 (`error.hpp`)
+
+核心路径全程无 C++ 异常、零堆分配，全部结果通过 `tcpshm::Result<T>`（`std::expected<T, tcpshm::Error>`）与 `tcpshm::VoidResult` 返回，可通过 `err.code`、`err.sys_errno` 与 `err.message()` 精准诊断错误原因。
+
+---
+
+## 4. 独立通道与代际句柄 `ConnHandle`
+
+* `tcpshm::ShmChannel<Config>` 与 `tcpshm::TcpChannel<Config>` 静态分离，内部不包含对方多余成员。
+* 每条上线连接自动分配 8 字节代际句柄 `tcpshm::ConnHandle`（包含 `group_id`、`slot_id`、31 位非零 `generation` 及 `TransportKind`）。
+* 在控制线程/单轮询架构中，调用 `server.with_channel(handle, fn)` 可完成 O(1) 槽位定位与代际比对，断线重连槽位复用时旧句柄自动失效（防止 ABA 误发）。
+
+---
+
+## 5. 服务端 (`server.hpp`) 与双 TCP Poller (`poller.hpp`)
+
+`Server<Handler, Config, TcpPoller>` 采用组合模式构造：`Server server(handler, server_name, ptcp_dir)`。
+
+### Handler 回调接口
+仅 `on_message` 为必需，其余控制面与错误回调按需实现（框架通过 `if constexpr (requires ...)` 自动识别）：
+
+```cpp
+struct MyHandler {
+    void on_message(auto& ch, tcpshm::MsgView msg); // 或返回 bool 支持背压
+
+    // 以下回调按需实现（全部可选）：
+    int on_new_connection(const struct sockaddr_in& addr,
+                          const tcpshm::detail::LoginMsg<MyConfig>& login,
+                          tcpshm::detail::LoginRspMsg<MyConfig>& rsp); // 返回目标 grpid 或 -1 拒绝
+    void on_client_logon(const struct sockaddr_in& addr, auto& ch);
+    void on_client_disconnected(auto& ch, tcpshm::Error reason);
+    void on_client_file_error(auto& ch, tcpshm::Error err);
+    void on_seq_mismatch(auto& ch, const tcpshm::SeqMismatchInfo& info);
+    void on_system_error(tcpshm::Error err);
+};
+```
+
+### 轮询策略与线程模型
+* **TCP 轮询策略 (`TcpPoller`)**：
+  * `tcpshm::BusyPoller`（默认）：跨平台零 syscall 空闲扫描，适合极少 TCP 连接追求极限低延迟的场景。
+  * `tcpshm::EpollPoller`（Linux 可选）：基于 `epoll_wait(..., 0)` 仅轮询就绪 socket，自动刷新未读完的 `recvbuf_` 缓冲与定期空闲心跳，避免大量 TCP 空连接产生 `O(N)` `recv()` 系统调用。
+* **控制面 `poll_ctl(steady_now())`**：**0ms 全非阻塞**状态机驱动 `accept`、登录、`ShmProbe` 探测、登录回包、SHM 心跳与退槽清理。
+* **数据面**：`poll_shm(grpid)` 与 `poll_tcp(steady_now(), grpid)` 可同线程依次轮询（参考 [`examples/echo_server_async.cpp`](../examples/echo_server_async.cpp)），也可拆分到各组独立绑核线程并行轮询（参考 [`examples/echo_server.cpp`](../examples/echo_server.cpp)）。
+
+---
+
+## 6. 客户端 (`client.hpp`)
+
+* `tcpshm::ShmClient<Handler, Config>`：纯 SHM 客户端（`connect(ip, port)` + `poll_shm()` + `poll_keepalive()`），零 PTCP 冗余开销。
+* `tcpshm::TcpClient<Handler, Config>`：纯持久化 TCP 客户端（`connect(ip, port)` + `poll_tcp()`），零 SHM 冗余开销。
+* `tcpshm::Client<Handler, Config>`：运行时可选择模式（`connect(TransportKind::Shm | Tcp, ip, port)`），提供 `with_channel(fn)` 静态分发发送（示例参见 [`examples/echo_client.cpp`](../examples/echo_client.cpp)）。
+
+客户端 `Handler` 仅需实现 `on_server_msg(tcpshm::MsgView)`，其余登录/断线/序列号错配回调均为可选。

@@ -1,99 +1,85 @@
 [English](README.md) | [中文](README-CN.md)
 
-**TCPSHM 是一个支持 Linux 和 Windows (C++20) 平台、基于 TCP 与共享内存 (SHM) IPC 的面向连接持久化消息队列框架**
+**TCPSHM v2 是一个基于现代 C++23、面向 Linux 与 Windows 的高性能共享内存 (SHM) IPC 与持久化 TCP 消息队列框架。**
 
-当使用 TCP 进行网络数据传输时，发送出的消息不能保证必定被对端接收并处理；更糟糕的是，由于网络异常或程序崩溃，两端经常会遇到突发的连接断开。因此，传统高可靠系统往往需要复杂的对账和恢复机制来确保通信两端的状态同步。**TCPSHM** 依靠严格的“序列号 + 确认应答 (Sequence Number & ACK)”机制提供了可靠且高效的解决方案：每一条发出的消息都会持久化存储在发送队列 (`.ptcp` 或 `.shm`) 中，直到发送方收到对端已成功消费该消息的 ACK 为止。因此，程序对断链与宕机崩溃具有完全的容错能力，断线重连后的数据恢复过程**纯自动且零丢失**。
+在原生 TCP 传输中，进程崩溃或网络闪断极易导致两端消息状态不一致。**TCPSHM** 通过“序列号 + ACK + mmap 持久化发送队列 (`PtcpQueue` `.ptcp`)”提供全自动、零丢失的断线重连恢复能力。
 
-正如库名所示，当通信双端部署在同一台物理主机上时，TCPSHM 支持无缝切换为**共享内存 (`use_shm = true`)** 模式。该模式对底层提供的 API 和行为表现与 TCP 完全一致（使用 TCP 还是 SHM 对应用层完全透明），但其吞吐量和低延迟表现**比本地环回 TCP 高出 20 倍以上**。共享内存通信底层核心基于一个实时单生产者单消费者无锁环形队列 (`SPSCVarQueue`)。
+当通信双方部署在同一物理主机时，切换到**共享内存模式 (`TransportKind::Shm`)** 可绕过内核网络栈，直接运行在无锁 `SpscQueue` 环形缓冲区上（Ping-Pong P50 RTT **`200 ns`**，相比本地环回 TCP 快 **`33x`**，流水线回显吞吐高达 **`90.7M msg/s`**）。框架在接入阶段自动执行**全非阻塞物理 SHM 探测握手**，防止跨容器或无权限环境下误用 SHM 引发崩溃。
 
-用户的业务消息内容在框架层面被视为通用二进制字节流，由业务调用方自行负责编解码。例如，用户为了极致性能可以使用 C/C++ POD 结构体，也可以使用现代 C++ 序列化库（如 [iguana](https://github.com/qicosmos/iguana)）或 Google Protocol Buffers + `std::variant` 以获得强大的扩展性。
+业务消息采用 **8 字节极简 `FrameHeader`**（单包有效载荷上限 `65527` 字节），并通过零开销 RAII `WriteGuard` / `ReadGuard` / `MsgView`（`std::span<std::byte>`、`write_pod`、`emplace`、`read_as<T>`）安全访问。既可零拷贝收发 POD 结构体，也可搭配附带的 [`iguana`](https://github.com/qicosmos/iguana) + `std::variant` 进行 Protobuf 序列化。
 
-此外，连接的双方均持有指定唯一名称 (`client_name` 与 `server_name`)，由双方名称对唯一标识一条持久化连接。如果一端断开连接并更改了自身名称后以新名称连接对端，该连接将被系统视为全新的会话，不再从原有的会话队列中恢复未处理消息。这一点在特定业务场景下非常实用：例如，每日高频交易服务器在收盘后停止、开盘前启动，每天启动时将服务器命名改为当天的日期名称（如 `"Server20260716"`），此时它预期与所有客户端建立的是全新会话，昨天收盘遗留的过期报单消息会被自动舍弃（昨天的废单在新的交易日已无意义）。
+## v2.0.0 核心架构演进
 
-TCPSHM 采用纯头文件 (Header-only) 设计，提供了服务端与客户端 C++ 模板类 (`TcpShmServer` 和 `TcpShmClient`)。对于服务端，框架原生的多分组轮询机制支持了**连接分片 (Connection Sharding)**：用户预定义一组或多组连接分组，并指派一个或多个线程轮询这些分组。当新连接接入时，用户回调可以自由决定将其指派到哪个分组中，从而拥有了对服务线程与客户端连接映射关系的完全掌控力。
+* **全面升级 C++23**：原生采用 `std::expected`（`Result<T, Error>`）、`std::byteswap`、`std::endian`、`std::span`、`std::atomic_ref`、`std::chrono::nanoseconds` 与 `ConfigConcept`/`HandlerConcept` 编译期约束；核心头文件严格零异常（通过 `-fno-exceptions -Werror` 验证）。
+* **零开销 RAII 收发 API**：彻底告别裸 `MsgHeader*` 指针算术和忘调 `Pop()`/`Push()` 卡死隐患。`WriteGuard` 离开作用域未提交会自动回滚 `cancel()`；`ReadGuard` 析构自动 `pop()`，也支持显式 `defer()` 实现背压重试。
+* **真·批量提交与消费**：`WriteGuard::stage()` + `flush()` 与 `drain(fn, max_batch)` 合并跨核原子发布与 TCP `send()` 系统调用，TCP 流水线吞吐最高提升 **20.5x**，SHM 吞吐最高提升 **2.8x**。
+* **静态分离传输通道**：拆分为紧凑独立的 [`ShmChannel`](include/tcpshm/shm_channel.hpp) 与 [`TcpChannel`](include/tcpshm/tcp_channel.hpp)，消灭热路径 `if (use_shm)` 分支并缩减通道对象内存占用。
+* **全非阻塞控制面状态机**：抛弃 v1 最长阻塞 300ms 的同步探测，`Server::poll_ctl()` 全程非阻塞推进 `ReadingLogin -> SendingProbeReq -> ReadingProbeRsp -> SendingLoginRsp`，任何卡死/慢连接 **0ms 阻塞** SHM 心跳与其他正常连接接入。
+* **原生代际连接句柄 `ConnHandle`**：8 字节 `{group_id, slot_id, generation, transport}` 句柄配合 `server.with_channel(handle, fn)` 天然免疫重连槽位复用的 ABA 问题，大幅简化异步业务架构。
+* **可插拔 TCP Poller 策略**：默认采用零系统调用延迟的 [`BusyPoller`](include/tcpshm/poller.hpp)，Linux 下支持编译期切换 [`EpollPoller`](include/tcpshm/poller.hpp) 以扩展多连接场景。
+* **协议与配置指纹防呆**：握手强制校验 `kProtocolMagic`、`kProtocolVersion = 2` 及 `config_fingerprint<Config>()`，`.ptcp` 文件校验魔数、版本与容量配置一致性。
 
-## 技术特性 (Technical Features)
-  * **多平台全面适配**：通过清晰干净的跨平台操作系统抽象层 (`os.h`)，打通并桥接了 **Windows** (`WinSock2` / `CreateFileMappingA` / `MapViewOfFile`) 与 **Linux** (`POSIX sockets` / `shm_open` / `mmap`)。
-  * **现代 C++20 构建**：深度应用现代 C++20 内存模型与标准库特性（使用 `std::atomic` / `std::atomic_ref` 配合 `memory_order_acquire`/`release` 构建无锁环形缓冲区、`std::endian` 与 `std::bit_cast` 字节序转换、`std::span` 边界视图以及 `std::has_single_bit`）。兼容 C++23。
-  * **纯头文件 (Header-only)**：只需 `#include "tcpshm/..."`，无需编译和链接静态库/动态库。
-  * **核心库零外部依赖**：核心 `tcpshm/` 头文件不依赖任何第三方基础库（示例程序 `server.cpp` / `client.cpp` 额外使用随库附带的 `third_party/iguana` 演示 Protobuf 序列化）。
-  * **极低延迟非阻塞**：除客户端发起的 `Connect()` 和首次 SHM 物理内存探测握手外，数据传输全链路非阻塞。
-  * **内部不主动创建任何线程**：轮询循环与线程调度完全交由应用层开发者自由设计。
-  * **热路径零系统时钟调用**：数据发送和收取的极速轮询链路不调用任何内核获取时间戳系统函数（由用户轮询循环传入时钟戳）。
-  * **核心库无 C++ 异常 (No Exceptions)**：确保嵌入式或硬实时交易系统的稳定与可预测性。
-  * **内部不进行任何 IO 打印或写日志**：无屏幕输出或文件写锁开销。
-  * **热路径零互斥锁或 CAS 操作**：在核心的 `Alloc()` / `Push()` / `Front()` / `Pop()` 路径中绝不使用有锁 Mutex 或原子 CAS 开销操作。
-  * **极其轻量、干净、高效**。
+## 目录与模块说明 (`include/tcpshm/`)
 
-## SHM Probe (物理共享内存握手探测机制)
+* [`tcpshm.hpp`](include/tcpshm/tcpshm.hpp)：统一聚合头文件。
+* [`config.hpp`](include/tcpshm/config.hpp)：`DefaultConfig`、`ConfigConcept`、`TimePoint`、`config_fingerprint<Config>()`。
+* [`error.hpp`](include/tcpshm/error.hpp)：零堆分配 `ErrorCode`、`Error`、`Result<T>`、`VoidResult`。
+* [`frame.hpp`](include/tcpshm/frame.hpp)：8 字节 `FrameHeader`、`MsgView`、`WriteGuard<Producer>`、`ReadGuard<Consumer>`。
+* [`conn_handle.hpp`](include/tcpshm/conn_handle.hpp)：8 字节代际连接句柄 `ConnHandle` 与 `TransportKind`。
+* [`spsc_queue.hpp`](include/tcpshm/spsc_queue.hpp)：隐式生命周期 `SpscRingLayout`、单缓存行隔离 `SpscProducer`/`SpscConsumer` 及进程内 `SpscQueue`。
+* [`ptcp_queue.hpp`](include/tcpshm/ptcp_queue.hpp)：支持魔数/版本/容量校验的 mmap 持久化 `PtcpQueue`。
+* [`shm_channel.hpp`](include/tcpshm/shm_channel.hpp) 与 [`tcp_channel.hpp`](include/tcpshm/tcp_channel.hpp)：静态分离的 SHM / PTCP 通道实现。
+* [`poller.hpp`](include/tcpshm/poller.hpp)：`BusyPoller`（跨平台默认）与 Linux `EpollPoller`。
+* [`server.hpp`](include/tcpshm/server.hpp) 与 [`client.hpp`](include/tcpshm/client.hpp)：组合式 `Server`、`ShmClient`、`TcpClient` 及运行时可切换 `Client`。
+* `detail/`：底层跨平台抽象（[`os_socket.hpp`](include/tcpshm/detail/os_socket.hpp)、[`os_shm.hpp`](include/tcpshm/detail/os_shm.hpp)、[`endian.hpp`](include/tcpshm/detail/endian.hpp)、[`protocol.hpp`](include/tcpshm/detail/protocol.hpp)）。
 
-当客户端尝试连接服务端并请求开启共享内存模式 (`use_shm = 1`) 时，为防止跨物理机部署、跨容器网络隔离或权限不足导致直接打开 SHM 崩溃或通信异常，`tcpshm` 在 TCP 登录阶段（`OnNewConnection` 授权通过之后）自动执行物理内存就绪探测握手协议：
+## 构建与 CMake 集成
 
-1. **发起登录请求**：客户端通过 TCP 发送 `LoginMsg` (`msg_type = 1`)，携带 `use_shm = 1` 及客户端名称。
-2. **服务端创建探测内存**：服务端经 `OnNewConnection` 授权后，生成唯一的防冲突随机 Token (`MakeShmProbeToken(client_name)`)，并以独占方式创建临时探测共享内存（如 `/tcpshm_probe_<token>_<seq>`），写入 `token` 并将 `ack` 置零。
-3. **下发探测协议**：服务端通过 TCP 发出 `ShmProbeReqMsg (msg_type = 3)`，包含探测内存名称与 `token`。
-4. **客户端验证与物理内存回写**：
-   * 客户端收到 `ShmProbeReqMsg`（仅在 `use_shm = true` 且探测名通过 `/tcpshm_probe_` 前缀及合法路径校验时受理）后，必须以**已存在读写模式**（`my_mmap_existing`，可读写但严禁创建权限）打开该共享内存。
-   * 客户端校验读出的 `probe->token == req->token` 无误后，计算 `ack = token ^ 0x5a5a5a5a5a5a5a5aULL`，并将该 `ack` 直接写入**物理共享内存 (`probe->ack`)**。
-5. **TCP 回执确认**：客户端通过 TCP 回发 `ShmProbeRspMsg (msg_type = 4)` 报告 `ack` 和 `ok = 1`。
-6. **双重校验允许升级**：服务端收到 TCP 回执后，除了验证 TCP 包中的 `rsp->ack` 与 `rsp->ok`，还会对**物理内存 `probe->ack`** 重新读取验证。只有当 TCP 协议层与物理内存映射层双重验证完毕，证明双方确实处在同一主机物理内存空间且拥有完备读写权限后，方才允许 `use_shm = 1` 登录并初始化/开启双向 `SPSCVarQueue` 队列；否则拒绝登录。
+需要 C++23 编译器（已在 Linux GCC 14.2.0 全面验证，Windows WinSock2 支持保留在 `detail/` 中）。
 
-## 使用限制 (Limitations)
-  * 不提供持久化到本地硬盘的机制，因此无法从掉电重启或系统崩溃中恢复（`.ptcp` 或 `.shm` 中的未消费消息在进程宕机崩溃重启后可完好恢复，但机器掉电或重启后不可恢复）。
-  * 由于为追求极致低延迟采用非阻塞忙轮询 (`PollTcp` / `PollShm`)，CPU 占用率在忙轮询循环中较高；如果应用对延迟不追求极端微秒级，可在轮询循环内部插入 `std::this_thread::yield()` 或微秒级 `sleep_for`。
-  * 当前仅允许在绑定的轮询接收线程内部对某条连接执行消息读写 (`Alloc/Push` 与 `Front/Pop`)；若需在业务多线程环境中向某连接写消息，必须先将其推入同步或无锁队列中，再由轮询线程取出并发出。
-  * 不支持跨多条消息的事务操作。如果在同一批次中调用多次 `Push()` 或 `Pop()`，若中途进程崩溃，要做好部分成功部分失败的容错准备。
-  * 单条消息的总长度须适合放入 `uint16_t`（包含 8 字节 `MsgHeader` 在内最大 65535 字节，有效负载上限 65527 字节）。
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
 
-## 接口文档与指南 (Documentation)
-  [接口文档 (中文)](doc/interface-CN.md) | [Interface Doc (English)](doc/interface.md)
+支持标准 `cmake --install` 安装与 `find_package(tcpshm CONFIG REQUIRED)` 导入，下游直接链接纯头文件目标：
 
-## 构建与 CMake 集成 (Build & CMake)
-  项目通过 CMake 默认启用 **C++20**（同时支持外部传入如 `-DCMAKE_CXX_STANDARD=23` 覆盖），并提供纯头文件 `INTERFACE` 目标 `tcpshm::tcpshm`：
+```cmake
+target_link_libraries(my_app PRIVATE tcpshm::tcpshm)
+```
 
-  ```bash
-  cmake -S . -B build
-  cmake --build build
-  ```
+## 文档与示例
 
-  下游工程只需链接 `tcpshm::tcpshm`（自动配置头文件路径、`cxx_std_20` 以及跨平台系统库：Linux 下 `Threads::Threads` / `rt`，Windows 下 `ws2_32`），并以 `#include "tcpshm/..."` 引入即可。
+* 接口开发指南：[中文](doc/interface-CN.md) | [English](doc/interface.md)
+* 分片同步服务端与客户端（基于 `iguana` Protobuf）：[`examples/common.hpp`](examples/common.hpp)、[`examples/echo_server.cpp`](examples/echo_server.cpp)、[`examples/echo_client.cpp`](examples/echo_client.cpp)
+* 双线程零锁异步服务端（原生 `ConnHandle` + `SpscQueue`）：[`examples/echo_server_async.cpp`](examples/echo_server_async.cpp)
 
-## 代码示例 (Example)
-  请参考 [`common.h`](common.h)、[`server.cpp`](server.cpp) 与 [`client.cpp`](client.cpp)，这是一个完整的 C++20 示例，演示了基于 TCP/SHM 的交互式登录与应答通信、[iguana](https://github.com/qicosmos/iguana) Protobuf 序列化、`std::variant` 消息派发以及分别针对 SHM 无锁链路与 TCP 加锁链路的显式双线程收发模型。
+## 测试矩阵
 
-## 测试与回归验证 (Testing)
-  仓库在 [`tests/tcpshm_test.cpp`](tests/tcpshm_test.cpp) 中内置了零第三方测试框架依赖的 CTest 回归测试集，覆盖 `Alloc()` 长度溢出拦截、`SPSCVarQueue` 环形回绕与并发 SPSC 压测、`PTCPQueue::Ack()` / `SanityCheckAndGetSeq()` 边界、畸形帧拒收、非 8 字节对齐部分发送 `EAGAIN` 恢复、`LoginMsg` 分片接收、TCP/SHM 往返与断线重连恢复以及 SHM 探针/非法名称校验：
+CTest 自动运行 4 套单元测试/集成测试、`-fno-exceptions` 编译门禁及 Benchmark 冒烟：
 
-  ```bash
-  ctest --test-dir build --output-on-failure
-  ```
+* [`tests/unit_spsc_test.cpp`](tests/unit_spsc_test.cpp)：长度上限、RAII Guard 自动取消/消费、回绕安全、多 `BlkSz`（16/32/64）、批量 `stage()+flush()`、`drain()` 背压重试及多线程压测。
+* [`tests/unit_ptcp_test.cpp`](tests/unit_ptcp_test.cpp)：持久化重启恢复、`uint32_t` 序列号回绕、损坏文件与容量不匹配识别。
+* [`tests/integration_handshake_test.cpp`](tests/integration_handshake_test.cpp)：慢连接/卡死 SHM 探针 **0ms 非阻塞** 隔离、配置不匹配/非法名/重复登录/超限拒收、`ConnHandle` ABA 防护。
+* [`tests/integration_server_client_test.cpp`](tests/integration_server_client_test.cpp)：SHM、`BusyPoller` TCP 与 Linux `EpollPoller` TCP 端到端全链路（含背压、重连续传与序列号错配）。
+* [`tests/noexcept_compile_check.cpp`](tests/noexcept_compile_check.cpp)：持续确保全部核心头文件可在 `-fno-exceptions -Werror` 下无错编译。
 
-## 性能测试与 Benchmark (Performance & Benchmark)
-  项目提供基于 C++20 编写的零外部依赖基准测试套件 [`benchmarks/tcpshm_bench.cpp`](benchmarks/tcpshm_bench.cpp)（使用 `std::jthread`、`std::latch`、`std::format`、`std::span`、`std::ranges`、`std::bit_cast`、`std::source_location` 与 `concepts`），覆盖 `SPSCVarQueue` 原始吞吐、TCP/SHM Ping-Pong RTT 分位数（P50/P99/P99.9）及流水线回显吞吐：
+## 性能基准对比 (`v1.0.0` vs `v2.0.0`)
 
-  ```bash
-  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-  cmake --build build -j
-  ./build/tcpshm_bench --mode=all --iters=50000 --warmup=2000 --sizes=16,64,256,1024
-  # 可选绑核参数：--pin-server=2 --pin-client=3
-  ```
+同机环境实测（Linux x86_64，GCC 14.2.0 `-O3 -DNDEBUG`，未绑核，`--iters=50000 --warmup=2000 --sizes=16,64,256`，参见 [`benchmarks/tcpshm_bench.cpp`](benchmarks/tcpshm_bench.cpp)）：
 
-  `ctest --test-dir build --output-on-failure` 也会自动执行快速冒烟用例 `tcpshm_bench_smoke`。
+```bash
+./build/tcpshm_bench --mode=all --iters=50000 --warmup=2000 --sizes=16,64,256
+# 可选绑核参数：--pin-server=2 --pin-client=3
+```
 
-  历史同机 Ping-Pong 往返延迟参考数据（平均单趟往返耗时 RTT = 总耗时 / 消息处理总数）：
-
-  * **TCP** 环回模式 RTT：**~8.8 us**
-  * **SHM** 共享内存模式 RTT：**~0.34 us**
-
-  *(由于内核态网络协议栈绕过与零拷贝 `SPSCVarQueue`，共享内存模式在同一主机上的传输延迟比 TCP 环回快 20 倍以上。)*
-
-## 头文件架构指南 (`tcpshm/`):
-
-* **`tcpshm_client.h`**：客户端模板类 (`TcpShmClient`)。负责发起连接握手、SHM 物理就绪探测处理及事件驱动轮询。
-* **`tcpshm_server.h`**：服务端模板类 (`TcpShmServer`)。支持多线程分组分片、SHM 握手校验、心跳检测与新连接接入管理。
-* **`tcpshm_conn.h`**：核心连接通用类 (`TcpShmConnection`)，透明封装了 TCP 队列 (`PTCPConnection`) 或 SHM 队列 (`SPSCVarQueue`)。提供 `Alloc()` / `Push()` 与 `Front()` / `Pop()` 收发接口。
-* **`msg_header.h`**：定义 8 字节对齐 (`alignas(8)`) 的 `MsgHeader` (`size`, `msg_type`, `ack_seq`) 及基于 `std::endian` 的字节序自适应转换。
-* **`os.h`**：跨平台操作系统底座抽象层（处理 Windows `WinSock2` / `CreateFileMappingA` 与 Linux POSIX 套接字 / `shm_open` / `mmap` 的适配），包含 `my_mmap`、`my_mmap_existing`、`my_munmap` 与 `my_shm_unlink`。
-* **`spsc_varq.h`**：现代 C++20 `std::atomic` 单生产者单消费者无锁可变长消息环形缓冲区队列。
-* **`ptcp_conn.h` & `ptcp_queue.h`**：TCP 连接封装、内置通信协议模板 (`LoginMsgTpl`, `LoginRspMsgTpl`, `ShmProbeReqMsg`, `ShmProbeRspMsg`) 以及支持 mmap 内存持久化的 TCP 队列 (`PTCPQueue`)。
-* **`endian.h` & `mmap.h`**：底层字节序静态推导转换模板 (`std::endian` + `std::bit_cast`) 与内存映射头文件包装 (`os.h`)。
+| 基准测试项 | v1.0.0 (16B / 64B / 256B) | v2.0.0 (16B / 64B / 256B) | 相对提升 |
+| --- | --- | --- | --- |
+| **Raw SPSC 单条吞吐** | 68.1M / 68.7M / 62.8M msg/s | 67.4M / 54.4M / 62.4M msg/s | 持平 (~1.0x) |
+| **Raw SPSC Batch-32** | — | **113.3M / 147.0M / 100.1M msg/s** | **1.59x – 2.14x** |
+| **SHM Ping-Pong P50 RTT** | 200 ns（均值 240 / 256 / 233 ns） | **200 ns**（均值 228 / 260 / 234 ns） | 相比 TCP 快 **33.0x** |
+| **TCP Ping-Pong P50 / P99 RTT** | 6.2 us / 16.3 us | Busy 6.6 / 16.3 us；Epoll 6.9 / **13.7–15.7 us** | Epoll P99 尾延迟更优 |
+| **流水线回显吞吐 (SHM)** | 39.0M / 29.6M / 11.3M msg/s | **90.7M / 69.2M / 31.9M msg/s** (`SHM-Batch`) | **2.32x – 2.82x** |
+| **流水线回显吞吐 (TCP)** | 273k / 270k / 268k msg/s | **5.59M / 4.85M / 4.41M msg/s** (`TCP-Busy`) | **16.5x – 20.5x** |
+| **流水线回显吞吐 (TCP Epoll)** | — | **5.24M / 4.64M / 4.34M msg/s** (`TCP-Epoll`) | **16.2x – 19.2x** |
