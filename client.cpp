@@ -88,7 +88,7 @@ class StringClient : public TSClient {
         PrintLine("Sequence mismatch detected.");
     }
 
-    // --- 业务逻辑：将 SHM（无锁）与 TCP（需互斥）两条链路拆分为独立双线程示例 ---
+    // --- 业务逻辑：主线程 Poll 收包 + 单个子线程 Send 发包，并将 SHM（无锁）与 TCP（加锁）彻底分离 ---
 
     void Run(const char* server_ip, uint16_t port, bool use_shm) {
         if (!Connect(use_shm, server_ip, port, 0)) return;
@@ -102,13 +102,11 @@ class StringClient : public TSClient {
     }
 
    private:
-    // 1) SHM 链路：shm_sendq_ 与 shm_recvq_ 为两条独立的无锁 SPSC 队列，无需 tcp_mtx
+    // 1) SHM 链路：主线程执行 PollShm/PollTcp，子线程无锁写入独立的 shm_sendq_（无需 tcp_mtx）
     void RunShm() {
-        std::thread shm_recv_thread(&StringClient::ShmRecvLoop, this);
         std::thread shm_send_thread(&StringClient::ShmSendLoop, this);
-
+        ShmRecvLoop();  // 主线程：轮询收包（同步回调 OnServerMsg / OnDisconnected）
         shm_send_thread.join();
-        shm_recv_thread.join();
     }
 
     void ShmRecvLoop() {
@@ -117,7 +115,7 @@ class StringClient : public TSClient {
             PollTcp(get_timestamp());  // SHM 模式下仅维持 TCP 心跳与断线检测，不碰 shm_sendq_
             this_thread::sleep_for(chrono::microseconds(100));
         }
-        // 连接关闭后补一次 PollTcp()，确保由本线程关闭 fd 并触发 OnDisconnected
+        // 连接关闭后补一次 PollTcp()，确保由主线程关闭 fd 并触发 OnDisconnected
         PollTcp(get_timestamp());
     }
 
@@ -127,14 +125,12 @@ class StringClient : public TSClient {
         });
     }
 
-    // 2) TCP 链路：PTCPConnection 收发共用 PTCPQueue/socket 状态，需用 tcp_mtx 串行保护 PollTcp 与 Send
+    // 2) TCP 链路：主线程 PollTcp 与子线程 Send 共用 PTCPConnection，需用 tcp_mtx 串行保护
     void RunTcp() {
         std::mutex tcp_mtx;
-        std::thread tcp_recv_thread(&StringClient::TcpRecvLoop, this, std::ref(tcp_mtx));
         std::thread tcp_send_thread(&StringClient::TcpSendLoop, this, std::ref(tcp_mtx));
-
+        TcpRecvLoop(tcp_mtx);  // 主线程：持锁轮询 PollTcp（同步回调 OnServerMsg / OnDisconnected）
         tcp_send_thread.join();
-        tcp_recv_thread.join();
     }
 
     void TcpRecvLoop(std::mutex& tcp_mtx) {
