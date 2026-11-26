@@ -30,6 +30,16 @@ SOFTWARE.
 namespace tcpshm {
 
 template<class Conf>
+consteval uint32_t shm_blk_size_of() {
+    if constexpr(requires { Conf::ShmBlkSize; }) {
+        return Conf::ShmBlkSize;
+    }
+    else {
+        return 64;
+    }
+}
+
+template<class Conf>
 class TcpShmConnection
 {
 public:
@@ -205,24 +215,24 @@ private:
     }
 
     MsgHeader* TcpFront(int64_t now) {
-        if(ptcp_conn_.IsClosed()) return nullptr;
-        ptcp_conn_.SendHB(now);
-        return ptcp_conn_.Front(); // for shm, we need to recv HB and Front() always return nullptr
+        return ptcp_conn_.Poll(now); // for shm, we need to recv HB and Poll() always return nullptr
     }
 
     MsgHeader* ShmFront() {
-        if(!shm_recvq_.IsAttached()) return nullptr;
+        if(!shm_recvq_.IsAttached()) [[unlikely]] return nullptr;
         return shm_recvq_.Front();
     }
 
 private:
+    static constexpr uint32_t ShmBlkSz = shm_blk_size_of<Conf>();
     const char* local_name_;
     char remote_name_[Conf::NameSize];
     const char* ptcp_dir_ = nullptr;
     PTCPConnection<Conf> ptcp_conn_;
-    using SHMQLayout = SPSCVarQueueLayout<Conf::ShmQueueSize>;
-    using SHMQHandle = SPSCVarQueueHandle<Conf::ShmQueueSize>;
-    alignas(64) SHMQHandle shm_sendq_;
-    SHMQHandle shm_recvq_;
+    using SHMQLayout = SPSCVarQueueLayout<Conf::ShmQueueSize, ShmBlkSz>;
+    using SHMQProducer = SPSCProducerHandle<Conf::ShmQueueSize, ShmBlkSz>;
+    using SHMQConsumer = SPSCConsumerHandle<Conf::ShmQueueSize, ShmBlkSz>;
+    alignas(64) SHMQProducer shm_sendq_;
+    alignas(64) SHMQConsumer shm_recvq_;
 };
 } // namespace tcpshm

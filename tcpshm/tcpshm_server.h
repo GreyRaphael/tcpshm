@@ -246,30 +246,38 @@ protected:
     // poll tcp for serving tcp connections
     void PollTcp(int64_t now, int grpid) {
         auto& grp = tcp_grps_[grpid];
-        if(stopping_.load(std::memory_order_acquire)) {
-            RetireActiveTcp(grp);
-            return;
-        }
-        if(grp.ctl_dirty.load(std::memory_order_acquire)) {
-            SyncTcpGroup(grp);
-        }
-        for(uint32_t j = 0; j < grp.active_cnt;) {
-            uint32_t slot = grp.active_slots[j];
-            Connection& conn = *grp.conns[slot];
-            MsgHeader* head = conn.TcpFront(now);
-            if(head) static_cast<Derived*>(this)->OnClientMsg(conn, head);
+        if(stopping_.load(std::memory_order_relaxed)) [[unlikely]] {
             if(stopping_.load(std::memory_order_acquire)) {
                 RetireActiveTcp(grp);
                 return;
             }
-            if(conn.TryCloseFd()) {
-                grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+        }
+        if(grp.ctl_dirty.load(std::memory_order_acquire)) [[unlikely]] {
+            SyncTcpGroup(grp);
+        }
+        for(uint32_t j = 0; j < grp.active_cnt;) {
+            uint32_t slot = grp.active_slots[j];
+            Connection& conn = *grp.active_conns[j];
+            MsgHeader* head = conn.TcpFront(now);
+            if(head) [[likely]] {
+                static_cast<Derived*>(this)->OnClientMsg(conn, head);
+                if(stopping_.load(std::memory_order_acquire)) [[unlikely]] {
+                    RetireActiveTcp(grp);
+                    return;
+                }
+            }
+            if(conn.TryCloseFd()) [[unlikely]] {
+                uint32_t last = --grp.active_cnt;
+                grp.active_slots[j] = grp.active_slots[last];
+                grp.active_conns[j] = grp.active_conns[last];
                 grp.slot_state[slot].store(SLOT_RETIRED, std::memory_order_release);
             }
-            else if(grp.slot_state[slot].load(std::memory_order_acquire) == SLOT_RETIRE_REQ) {
+            else if(grp.slot_state[slot].load(std::memory_order_acquire) == SLOT_RETIRE_REQ) [[unlikely]] {
                 conn.Close();
                 conn.TryCloseFd();
-                grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+                uint32_t last = --grp.active_cnt;
+                grp.active_slots[j] = grp.active_slots[last];
+                grp.active_conns[j] = grp.active_conns[last];
                 grp.slot_state[slot].store(SLOT_RETIRED, std::memory_order_release);
             }
             else {
@@ -281,21 +289,24 @@ protected:
     // poll shm for serving shm connections
     void PollShm(int grpid) {
         auto& grp = shm_grps_[grpid];
-        if(stopping_.load(std::memory_order_acquire)) {
-            RetireActiveShm(grp);
-            return;
-        }
-        if(grp.ctl_dirty.load(std::memory_order_acquire)) {
-            SyncShmGroup(grp);
-        }
-        for(uint32_t j = 0; j < grp.active_cnt; j++) {
-            uint32_t slot = grp.active_slots[j];
-            Connection& conn = *grp.conns[slot];
-            MsgHeader* head = conn.ShmFront();
-            if(head) static_cast<Derived*>(this)->OnClientMsg(conn, head);
+        if(stopping_.load(std::memory_order_relaxed)) [[unlikely]] {
             if(stopping_.load(std::memory_order_acquire)) {
                 RetireActiveShm(grp);
                 return;
+            }
+        }
+        if(grp.ctl_dirty.load(std::memory_order_acquire)) [[unlikely]] {
+            SyncShmGroup(grp);
+        }
+        for(uint32_t j = 0; j < grp.active_cnt; j++) {
+            Connection& conn = *grp.active_conns[j];
+            MsgHeader* head = conn.ShmFront();
+            if(head) [[likely]] {
+                static_cast<Derived*>(this)->OnClientMsg(conn, head);
+                if(stopping_.load(std::memory_order_acquire)) [[unlikely]] {
+                    RetireActiveShm(grp);
+                    return;
+                }
             }
         }
     }
@@ -413,6 +424,7 @@ private:
         std::atomic<uint8_t> slot_state[N]{};
         alignas(64) uint32_t active_cnt = 0;
         uint32_t active_slots[N]{};
+        Connection* active_conns[N]{};
     };
 
     template<uint32_t N>
@@ -424,7 +436,9 @@ private:
                 uint8_t expected = SLOT_PENDING_ADD;
                 if(grp.slot_state[i].compare_exchange_strong(
                        expected, SLOT_LIVE, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    grp.active_slots[grp.active_cnt++] = i;
+                    uint32_t pos = grp.active_cnt++;
+                    grp.active_slots[pos] = i;
+                    grp.active_conns[pos] = grp.conns[i];
                 }
                 else if(expected == SLOT_RETIRE_REQ) {
                     grp.conns[i]->Close();
@@ -435,7 +449,9 @@ private:
             else if(st == SLOT_RETIRE_REQ) {
                 for(uint32_t j = 0; j < grp.active_cnt; j++) {
                     if(grp.active_slots[j] == i) {
-                        grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+                        uint32_t last = --grp.active_cnt;
+                        grp.active_slots[j] = grp.active_slots[last];
+                        grp.active_conns[j] = grp.active_conns[last];
                         break;
                     }
                 }
@@ -455,7 +471,9 @@ private:
                 uint8_t expected = SLOT_PENDING_ADD;
                 if(grp.slot_state[i].compare_exchange_strong(
                        expected, SLOT_LIVE, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    grp.active_slots[grp.active_cnt++] = i;
+                    uint32_t pos = grp.active_cnt++;
+                    grp.active_slots[pos] = i;
+                    grp.active_conns[pos] = grp.conns[i];
                 }
                 else if(expected == SLOT_RETIRE_REQ) {
                     grp.slot_state[i].store(SLOT_RETIRED, std::memory_order_release);
@@ -464,7 +482,9 @@ private:
             else if(st == SLOT_RETIRE_REQ) {
                 for(uint32_t j = 0; j < grp.active_cnt; j++) {
                     if(grp.active_slots[j] == i) {
-                        grp.active_slots[j] = grp.active_slots[--grp.active_cnt];
+                        uint32_t last = --grp.active_cnt;
+                        grp.active_slots[j] = grp.active_slots[last];
+                        grp.active_conns[j] = grp.active_conns[last];
                         break;
                     }
                 }

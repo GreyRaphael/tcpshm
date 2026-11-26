@@ -160,6 +160,7 @@ public:
         Close("Release", 0);
         TryCloseFd();
         send_byte_off_ = 0;
+        overflow_buf_.reset();
         if(q_) {
             my_munmap<PTCPQ>(q_);
             q_ = nullptr;
@@ -183,88 +184,56 @@ public:
         }
         if(q_) {
             q_->LoginAck(remote_ack_seq);
-            SendPending();
+            SendPendingWithFd(sock_fd);
         }
     }
 
     MsgHeader* Alloc(uint16_t size) {
-        if(!q_) return nullptr;
+        if(!q_) [[unlikely]] return nullptr;
         return q_->Alloc(size);
     }
 
     void Push() {
-        if(!q_) return;
+        if(!q_) [[unlikely]] return;
         q_->Push();
         SendPending();
     }
 
     void PushMore() {
-        if(!q_) return;
+        if(!q_) [[unlikely]] return;
         q_->Push();
+    }
+
+    // Combined poll: loads sockfd_ once, flushes pending/HB at most once, then reads incoming frames.
+    MsgHeader* Poll(int64_t now) {
+        tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
+        if(fd == INVALID_TCP_SOCKET) [[unlikely]] return nullptr;
+        now_ = now;
+        bool tried_send = false;
+        if(q_ && (send_byte_off_ > 0 || q_->HasSendable())) {
+            tried_send = true;
+            SendPendingWithFd(fd);
+            fd = sockfd_.load(std::memory_order_acquire);
+            if(fd == INVALID_TCP_SOCKET) [[unlikely]] return nullptr;
+        }
+        if(!tried_send && now_ - send_time_ >= Conf::HeartBeatInverval) [[unlikely]] {
+            SendHBFrame(fd);
+            fd = sockfd_.load(std::memory_order_acquire);
+            if(fd == INVALID_TCP_SOCKET) [[unlikely]] return nullptr;
+        }
+        return FrontWithFd(fd, false);
     }
 
     // safe if IsClosed
     MsgHeader* Front() {
-        if(IsClosed()) return nullptr;
-        if(UseShm()) { // for shm, we only expect HB in tcp channel so just read something and ignore
-            DoRecv();
-            return nullptr;
-        }
-        if(q_ && (send_byte_off_ > 0 || q_->HasSendable())) {
-            SendPending();
-            if(IsClosed()) return nullptr;
-        }
-        while(nextmsg_idx_ != readidx_) {
-            MsgHeader* header = (MsgHeader*)&recvbuf_[readidx_];
-            if(header->msg_type == HeartbeatMsg::msg_type) {
-                readidx_ += sizeof(MsgHeader);
-                continue;
-            }
-            // if user didn't pop last msg, we need to keep reading for updating ack_seq
-            if(last_my_ack_ == q_->MyAck()) break;
-            last_my_ack_ = q_->MyAck();
-            return header;
-        }
-
-        if(int len = DoRecv()) {
-            uint32_t old_writeidx = writeidx_;
-            writeidx_ += static_cast<uint32_t>(len);
-            while(writeidx_ - nextmsg_idx_ >= sizeof(MsgHeader)) {
-                MsgHeader* header = (MsgHeader*)&recvbuf_[nextmsg_idx_];
-                if(old_writeidx < nextmsg_idx_ + static_cast<uint32_t>(sizeof(MsgHeader))) { // we haven't converted this header
-                    header->ConvertByteOrder<Conf::ToLittleEndian>();
-                }
-                if(header->size < sizeof(MsgHeader) ||
-                   (header->msg_type == HeartbeatMsg::msg_type && header->size != sizeof(MsgHeader))) {
-                    Close("Invalid msg header", 0);
-                    return nullptr;
-                }
-                uint32_t msg_size = (static_cast<uint32_t>(header->size) + 7u) & ~7u;
-                if(msg_size > Conf::TcpRecvBufMaxSize) {
-                    Close("Msg size larger than recv buf max size", 0);
-                    return nullptr;
-                }
-                if(!q_->Ack(header->ack_seq)) {
-                    Close("Invalid ack_seq", 0);
-                    return nullptr;
-                }
-                if(writeidx_ - nextmsg_idx_ < msg_size) break;
-                // we have got a full msg
-                if(header->msg_type == HeartbeatMsg::msg_type && readidx_ == nextmsg_idx_) {
-                    readidx_ += msg_size;
-                }
-                nextmsg_idx_ += msg_size;
-            }
-        }
-        if(readidx_ != nextmsg_idx_) {
-            return (MsgHeader*)&recvbuf_[readidx_];
-        }
-        return nullptr;
+        tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
+        if(fd == INVALID_TCP_SOCKET) [[unlikely]] return nullptr;
+        return FrontWithFd(fd, true);
     }
 
     // we have consumed the msg we got from Front()
     void Pop() {
-        if(!q_ || readidx_ == nextmsg_idx_) return;
+        if(!q_ || readidx_ == nextmsg_idx_) [[unlikely]] return;
         MsgHeader* header = (MsgHeader*)&recvbuf_[readidx_];
         readidx_ += (static_cast<uint32_t>(header->size) + 7u) & ~7u;
         q_->MyAck()++;
@@ -273,63 +242,20 @@ public:
     // safe if IsClosed
     void SendHB(int64_t now) {
         tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
-        if(fd == INVALID_TCP_SOCKET) return;
+        if(fd == INVALID_TCP_SOCKET) [[unlikely]] return;
         now_ = now;
         if(q_ && (send_byte_off_ > 0 || q_->HasSendable())) {
-            if(SendPending()) return;
+            if(SendPendingWithFd(fd)) return;
         }
-        if(now_ - send_time_ < Conf::HeartBeatInverval) return;
-        if(q_) {
-            hbmsg_.ack_seq = Endian<Conf::ToLittleEndian>::Convert(q_->MyAck());
-        }
-        int sent = tcp_send(fd, (const char*)&hbmsg_, sizeof(hbmsg_), TCP_MSG_NOSIGNAL);
-        if(sent < 0 && tcp_is_retryable_err(tcp_get_last_error())) return;
-        if(sent != (int)sizeof(MsgHeader)) { // for simplicity, we see partial sendout as error
-            Close("Send error", sent < 0 ? tcp_get_last_error() : 0);
-            return;
-        }
-        send_time_ = now_; // successfully sent
+        if(now_ - send_time_ < Conf::HeartBeatInverval) [[likely]] return;
+        SendHBFrame(fd);
     }
 
     // return false only if no pending data to send (or closed)
     bool SendPending() {
         tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
-        if(fd == INVALID_TCP_SOCKET || !q_) return false;
-        int blk_sz;
-        const char* base = reinterpret_cast<const char*>(q_->GetSendable(blk_sz));
-        if(blk_sz <= 0) {
-            send_byte_off_ = 0;
-            return false;
-        }
-        uint32_t total_bytes = (static_cast<uint32_t>(blk_sz) << 3) - send_byte_off_;
-        const char* p = base + send_byte_off_;
-        uint32_t sent_total = 0;
-        while(sent_total < total_bytes) {
-            int sent = tcp_send(fd, p + sent_total, static_cast<int>(total_bytes - sent_total), TCP_MSG_NOSIGNAL);
-            if(sent <= 0) {
-                if(sent == 0) {
-                    Close("Send error", 0);
-                    return false;
-                }
-                int err = tcp_get_last_error();
-                if(tcp_is_retryable_err(err)) {
-                    break;
-                }
-                Close("Send error", err);
-                return false;
-            }
-            sent_total += static_cast<uint32_t>(sent);
-        }
-        if(sent_total > 0) {
-            send_time_ = now_;
-            uint32_t total_consumed = static_cast<uint32_t>(send_byte_off_) + sent_total;
-            uint32_t sent_blk = total_consumed >> 3;
-            send_byte_off_ = static_cast<uint8_t>(total_consumed & 7u);
-            if(sent_blk > 0) {
-                q_->Sendout(static_cast<int>(sent_blk));
-            }
-        }
-        return true;
+        if(fd == INVALID_TCP_SOCKET || !q_) [[unlikely]] return false;
+        return SendPendingWithFd(fd);
     }
 
     bool IsClosed() const {
@@ -369,11 +295,143 @@ private:
         sockfd_.store(INVALID_TCP_SOCKET, std::memory_order_release);
     }
 
+    void SendHBFrame(tcp_socket_t fd) {
+        if(q_) {
+            hbmsg_.ack_seq = Endian<Conf::ToLittleEndian>::Convert(q_->MyAck());
+        }
+        int sent = tcp_send(fd, (const char*)&hbmsg_, sizeof(hbmsg_), TCP_MSG_NOSIGNAL);
+        if(sent < 0 && tcp_is_retryable_err(tcp_get_last_error())) return;
+        if(sent != (int)sizeof(MsgHeader)) [[unlikely]] { // for simplicity, we see partial sendout as error
+            Close("Send error", sent < 0 ? tcp_get_last_error() : 0);
+            return;
+        }
+        send_time_ = now_; // successfully sent
+    }
+
+    bool SendPendingWithFd(tcp_socket_t fd) {
+        int blk_sz;
+        const char* base = reinterpret_cast<const char*>(q_->GetSendable(blk_sz));
+        if(blk_sz <= 0) {
+            send_byte_off_ = 0;
+            return false;
+        }
+        uint32_t total_bytes = (static_cast<uint32_t>(blk_sz) << 3) - send_byte_off_;
+        const char* p = base + send_byte_off_;
+        uint32_t sent_total = 0;
+        while(sent_total < total_bytes) {
+            int sent = tcp_send(fd, p + sent_total, static_cast<int>(total_bytes - sent_total), TCP_MSG_NOSIGNAL);
+            if(sent <= 0) [[unlikely]] {
+                if(sent == 0) {
+                    Close("Send error", 0);
+                    return false;
+                }
+                int err = tcp_get_last_error();
+                if(tcp_is_retryable_err(err)) {
+                    break;
+                }
+                Close("Send error", err);
+                return false;
+            }
+            sent_total += static_cast<uint32_t>(sent);
+        }
+        if(sent_total > 0) {
+            send_time_ = now_;
+            uint32_t total_consumed = static_cast<uint32_t>(send_byte_off_) + sent_total;
+            uint32_t sent_blk = total_consumed >> 3;
+            send_byte_off_ = static_cast<uint8_t>(total_consumed & 7u);
+            if(sent_blk > 0) {
+                q_->Sendout(static_cast<int>(sent_blk));
+            }
+        }
+        return true;
+    }
+
+    MsgHeader* FrontWithFd(tcp_socket_t fd, bool flush_pending) {
+        if(UseShm()) { // for shm, we only expect HB in tcp channel so just read something and ignore
+            DoRecvShm(fd);
+            return nullptr;
+        }
+        if(flush_pending && q_ && (send_byte_off_ > 0 || q_->HasSendable())) {
+            SendPendingWithFd(fd);
+            fd = sockfd_.load(std::memory_order_acquire);
+            if(fd == INVALID_TCP_SOCKET) [[unlikely]] return nullptr;
+        }
+        while(nextmsg_idx_ != readidx_) {
+            MsgHeader* header = (MsgHeader*)&recvbuf_[readidx_];
+            if(header->msg_type == HeartbeatMsg::msg_type) {
+                readidx_ += sizeof(MsgHeader);
+                continue;
+            }
+            // if user didn't pop last msg, we need to keep reading for updating ack_seq
+            if(last_my_ack_ == q_->MyAck()) break;
+            last_my_ack_ = q_->MyAck();
+            return header;
+        }
+
+        if(int len = DoRecv(fd)) {
+            uint32_t old_writeidx = writeidx_;
+            writeidx_ += static_cast<uint32_t>(len);
+            while(writeidx_ - nextmsg_idx_ >= sizeof(MsgHeader)) {
+                MsgHeader* header = (MsgHeader*)&recvbuf_[nextmsg_idx_];
+                if(old_writeidx < nextmsg_idx_ + static_cast<uint32_t>(sizeof(MsgHeader))) { // we haven't converted this header
+                    header->ConvertByteOrder<Conf::ToLittleEndian>();
+                }
+                if(header->size < sizeof(MsgHeader) ||
+                   (header->msg_type == HeartbeatMsg::msg_type && header->size != sizeof(MsgHeader))) [[unlikely]] {
+                    Close("Invalid msg header", 0);
+                    return nullptr;
+                }
+                uint32_t msg_size = (static_cast<uint32_t>(header->size) + 7u) & ~7u;
+                if(msg_size > Conf::TcpRecvBufMaxSize) [[unlikely]] {
+                    Close("Msg size larger than recv buf max size", 0);
+                    return nullptr;
+                }
+                if(!q_->Ack(header->ack_seq)) [[unlikely]] {
+                    Close("Invalid ack_seq", 0);
+                    return nullptr;
+                }
+                if(writeidx_ - nextmsg_idx_ < msg_size) break;
+                // we have got a full msg
+                if(header->msg_type == HeartbeatMsg::msg_type && readidx_ == nextmsg_idx_) {
+                    readidx_ += msg_size;
+                }
+                nextmsg_idx_ += msg_size;
+            }
+        }
+        if(readidx_ != nextmsg_idx_) {
+            return (MsgHeader*)&recvbuf_[readidx_];
+        }
+        return nullptr;
+    }
+
+    void DoRecvShm(tcp_socket_t fd) {
+        char hb_buf[256];
+        while(true) {
+            int ret = tcp_recv(fd, hb_buf, sizeof(hb_buf), 0);
+            if(ret > 0) {
+                recv_time_ = now_;
+                if(ret < static_cast<int>(sizeof(hb_buf))) return;
+                continue;
+            }
+            if(ret == 0) [[unlikely]] {
+                Close("Remote close", 0);
+                return;
+            }
+            int err = tcp_get_last_error();
+            if(tcp_is_retryable_err(err)) [[likely]] {
+                if(now_ - recv_time_ > Conf::ConnectionTimeout) [[unlikely]] {
+                    Close("Timeout", 0);
+                }
+            }
+            else {
+                Close("Read error", err);
+            }
+            return;
+        }
+    }
+
     // For Windows: use WSARecv to simulate readv
-    int DoRecv() {
-        tcp_socket_t fd = sockfd_.load(std::memory_order_acquire);
-        if(fd == INVALID_TCP_SOCKET) return 0;
-        char stackbuf[65536];
+    int DoRecv(tcp_socket_t fd) {
         if(readidx_ > 0 && readidx_ == writeidx_) {
             readidx_ = nextmsg_idx_ = writeidx_ = 0;
         }
@@ -381,26 +439,29 @@ private:
         // we should avoid buffer expansion
         // if total writable size is less than a half of recvbuf_size_, allow buffer expansion
         bool allow_expand = (writable + readidx_) * 2 < recvbuf_size_;
-        uint32_t extra_size = std::min((uint32_t)sizeof(stackbuf),
+        uint32_t extra_size = std::min(OverflowCap,
                                        readidx_ + (allow_expand ? Conf::TcpRecvBufMaxSize - recvbuf_size_ : 0));
-        if(writable + extra_size == 0) return 0;
+        if(writable + extra_size == 0) [[unlikely]] return 0;
         int ret;
-        if(extra_size == 0){
+        if(extra_size == 0) [[likely]] {
             ret = tcp_recv(fd, &recvbuf_[writeidx_], static_cast<int>(writable), 0);
         }
         else {
+            if(!overflow_buf_) [[unlikely]] {
+                overflow_buf_.reset(new char[OverflowCap]);
+            }
             struct iovec vec[2];
             vec[0].iov_base = &recvbuf_[writeidx_];
             vec[0].iov_len = writable;
-            vec[1].iov_base = stackbuf;
+            vec[1].iov_base = overflow_buf_.get();
             vec[1].iov_len = extra_size;
             ret = tcp_readv(fd, vec);
         }
         if(ret <= 0) {
-            if(ret < 0) {
+            if(ret < 0) [[likely]] {
                 int err = tcp_get_last_error();
-                if(tcp_is_retryable_err(err)) {
-                    if(now_ - recv_time_ > Conf::ConnectionTimeout) {
+                if(tcp_is_retryable_err(err)) [[likely]] {
+                    if(now_ - recv_time_ > Conf::ConnectionTimeout) [[unlikely]] {
                         Close("Timeout", 0);
                     }
                 }
@@ -414,11 +475,11 @@ private:
             return 0;
         }
         recv_time_ = now_;
-        if(ret <= static_cast<int>(writable)) return ret;
+        if(ret <= static_cast<int>(writable)) [[likely]] return ret;
         uint32_t uret = static_cast<uint32_t>(ret);
         if(uret <= writable + readidx_) { // need to memmove
             memmove(&recvbuf_[0], &recvbuf_[readidx_], recvbuf_size_ - readidx_);
-            memcpy(&recvbuf_[recvbuf_size_ - readidx_], stackbuf, uret - writable);
+            memcpy(&recvbuf_[recvbuf_size_ - readidx_], overflow_buf_.get(), uret - writable);
         }
         else { // need to expand buffer
             // newbufsize must be large enough to hold all data just read
@@ -429,7 +490,7 @@ private:
             // std::cout << "expand: " << recvbuf_size_ << " -> " << newbufsize << std::endl;
             std::unique_ptr<char[]> new_buf(new char[newbufsize]);
             memcpy(&new_buf[0], &recvbuf_[readidx_], recvbuf_size_ - readidx_);
-            memcpy(&new_buf[recvbuf_size_ - readidx_], stackbuf, uret - writable);
+            memcpy(&new_buf[recvbuf_size_ - readidx_], overflow_buf_.get(), uret - writable);
             recvbuf_size_ = newbufsize;
             std::swap(recvbuf_, new_buf);
         }
@@ -441,6 +502,7 @@ private:
     }
 
 private:
+    static constexpr uint32_t OverflowCap = Conf::TcpRecvBufMaxSize < 65536u ? Conf::TcpRecvBufMaxSize : 65536u;
     using PTCPQ = PTCPQueue<Conf::TcpQueueSize, Conf::ToLittleEndian>;
     PTCPQ* q_ = nullptr; // may be mmaped to file
     std::atomic<tcp_socket_t> sockfd_{INVALID_TCP_SOCKET};
@@ -452,6 +514,7 @@ private:
     static_assert((Conf::TcpRecvBufInitSize % 8) == 0, "Conf::TcpRecvBufInitSize must be a multiple of 8");
     static_assert((Conf::TcpRecvBufMaxSize % 8) == 0, "Conf::TcpRecvBufMaxSize must be a multiple of 8");
     std::unique_ptr<char[]> recvbuf_;
+    std::unique_ptr<char[]> overflow_buf_;
     uint32_t recvbuf_size_ = 0;
     uint32_t writeidx_ = 0;
     uint32_t nextmsg_idx_ = 0;

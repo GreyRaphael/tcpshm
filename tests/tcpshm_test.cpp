@@ -627,6 +627,10 @@ void test_server_integration(const std::string& dir, CleanupGuard& guard) {
     rsrv.Stop();
 }
 
+struct CompactConf : public TestConf {
+    static constexpr uint32_t ShmBlkSize = 16;
+};
+
 void test_spsc_layout_handle_and_blksz() {
     using DefaultLayout = SPSCVarQueueLayout<4096>;
     using CompactLayout = SPSCVarQueueLayout<256, 16>;
@@ -731,6 +735,37 @@ void test_spsc_layout_handle_and_blksz() {
     t_prod.join();
     t_cons.join();
     TEST_CHECK(cons_h2.Front() == nullptr);
+
+    // Optional Conf::ShmBlkSize detection via C++20 requires + split Producer/Consumer handles
+    static_assert(shm_blk_size_of<TestConf>() == 64);
+    static_assert(shm_blk_size_of<CompactConf>() == 16);
+    static_assert(sizeof(SPSCProducerHandle<4096>) == 64);
+    static_assert(sizeof(SPSCConsumerHandle<4096>) == 64);
+
+    auto split_layout = std::make_unique<SPSCVarQueueLayout<1024, 16>>();
+    SPSCProducerHandle<1024, 16> p_only;
+    SPSCConsumerHandle<1024, 16> c_only;
+    p_only.Attach(split_layout.get());
+    c_only.Attach(split_layout.get());
+    p_only.Reset();
+    c_only.Attach(split_layout.get());
+    for (uint32_t i = 0; i < 64; ++i) {
+        MsgHeader* h = p_only.Alloc(8);
+        TEST_CHECK(h != nullptr);
+        h->msg_type = 9;
+        std::memcpy(h + 1, &i, sizeof(i));
+        p_only.Push();
+    }
+    TEST_CHECK(p_only.Alloc(8) == nullptr);
+    for (uint32_t i = 0; i < 64; ++i) {
+        MsgHeader* h = c_only.Front();
+        TEST_CHECK(h != nullptr && h->msg_type == 9);
+        uint32_t v = 0;
+        std::memcpy(&v, h + 1, sizeof(v));
+        TEST_CHECK(v == i);
+        c_only.Pop();
+    }
+    TEST_CHECK(c_only.Front() == nullptr);
 }
 
 } // namespace

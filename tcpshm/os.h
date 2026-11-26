@@ -357,6 +357,18 @@ inline const char* shm_name_win(const char* name) {
   if (!name) return "";
   return (*name == '/') ? name + 1 : name;
 }
+#else
+inline void* posix_mmap_fd(int fd, size_t len) {
+#ifdef MAP_POPULATE
+  void* ret = ::mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+  if (ret == MAP_FAILED) {
+    ret = ::mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  }
+  return ret;
+#else
+  return ::mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+#endif
+}
 #endif
 
 template<class T>
@@ -442,7 +454,7 @@ T* my_mmap(const char* filename, bool use_shm, const char** error_msg, bool excl
     errno = saved_errno;
     return nullptr;
   }
-  T* ret = (T*)mmap(0, sizeof(T), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  T* ret = static_cast<T*>(posix_mmap_fd(fd, sizeof(T)));
   int mmap_errno = errno;
   close(fd);
   if (ret == MAP_FAILED) {
@@ -527,7 +539,7 @@ T* my_mmap_existing(const char* filename, bool use_shm, const char** error_msg) 
     errno = EINVAL;
     return nullptr;
   }
-  T* ret = (T*)mmap(0, sizeof(T), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  T* ret = static_cast<T*>(posix_mmap_fd(fd, sizeof(T)));
   int mmap_errno = errno;
   close(fd);
   if (ret == MAP_FAILED) {
