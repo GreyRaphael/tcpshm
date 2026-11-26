@@ -277,13 +277,16 @@ public:
 ```
 
 ### Threading and Polling Model
-The server gives you complete control over threading and connection sharding. You can run one thread per group or poll everything from a single loop:
+The server supports flexible connection sharding. During login, `PollCtl()` routes each client according to `login->use_shm` and the `grpid` returned by `OnNewConnection()`:
+* **TCP clients (`use_shm = false`)**: Placed into `tcp_grps_[grpid]` and served exclusively by `PollTcp(now, grpid)` (messages, heartbeats, and disconnect detection; never polled by `PollShm`).
+* **SHM clients (`use_shm = true`)**: Placed into `shm_grps_[grpid]`; business messages (`OnClientMsg`) are served exclusively by `PollShm(grpid)` (never polled by `PollTcp`), while TCP keepalive heartbeats are handled by `PollCtl(now)`.
+* **Control-plane callbacks**: `OnNewConnection`, `OnClientLogon`, and `OnClientDisconnected` always run on the `PollCtl(now)` thread.
 
 ```c++
 // Start listening on ip and port
 bool Start(const char* listen_ipv4, uint16_t listen_port);
 
-// Poll control: accepts new connections, performs SHM probe checks, and cleans up retired connections
+// Poll control: accepts new connections, runs SHM probe checks, serves SHM TCP heartbeats, and cleans up retired connections
 void PollCtl(int64_t now);
 
 // Poll specific TCP connection group (0 <= grpid < MaxTcpGrps)
@@ -294,6 +297,72 @@ void PollShm(int grpid);
 
 // Stop listening and release all connections
 void Stop();
+```
+
+#### Mode 1: Simple Single-Thread Polling
+* **When to use**: Development, tests, or low-volume single-process servers where occasional latency spikes during new-connection handshakes (`accept`, `mmap`, or up to 300ms blocking `VerifyShmProbe`) are acceptable.
+* **Pros**: Zero thread-management overhead; all callbacks execute sequentially on the main thread.
+
+```c++
+void RunSingleThread(const char* ip, uint16_t port, std::atomic<bool>& running) {
+    if (!Start(ip, port)) return;
+
+    while (running.load(std::memory_order_acquire)) {
+        int64_t ts = get_timestamp();
+        for (int i = 0; i < static_cast<int>(Conf::MaxTcpGrps); ++i) PollTcp(ts, i);
+        for (int i = 0; i < static_cast<int>(Conf::MaxShmGrps); ++i) PollShm(i);
+        PollCtl(ts);
+        std::this_thread::yield(); // use sleep_for(...) if minimal latency is not needed
+    }
+    Stop();
+}
+```
+
+#### Mode 2: Multi-Thread Sharded Polling (Recommended for Low-Latency / Production)
+* **When to use**: HFT and latency-sensitive production workloads requiring isolation and multi-core sharding.
+* **Pros**:
+  1. Isolates blocking/syscall work (`PollCtl` `accept`/`mmap`/`VerifyShmProbe` and `PollTcp` socket I/O) from the sub-microsecond user-space `PollShm` hot path.
+  2. Enables per-group CPU pinning across cores.
+  3. See [`server.cpp`](../server.cpp) for synchronous request-response workers, or [`server_async.cpp`](../server_async.cpp) for lock-free I/O-to-business decoupling.
+
+```c++
+void RunMultiThread(const char* ip, uint16_t port, std::atomic<bool>& running) {
+    if (!Start(ip, port)) return;
+
+    std::vector<std::thread> workers;
+    workers.reserve(Conf::MaxTcpGrps + Conf::MaxShmGrps);
+
+    // TCP workers: each serves only TCP clients routed to its grpid
+    for (int i = 0; i < static_cast<int>(Conf::MaxTcpGrps); ++i) {
+        workers.emplace_back([this, &running, grpid = i]() {
+            while (running.load(std::memory_order_acquire)) {
+                PollTcp(get_timestamp(), grpid);
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    // SHM workers: each serves only SHM client messages routed to its grpid
+    for (int i = 0; i < static_cast<int>(Conf::MaxShmGrps); ++i) {
+        workers.emplace_back([this, &running, grpid = i]() {
+            while (running.load(std::memory_order_acquire)) {
+                PollShm(grpid);
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    // Control loop: handles new logins, SHM probing, SHM TCP keepalives, and disconnects
+    while (running.load(std::memory_order_acquire)) {
+        PollCtl(get_timestamp());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    for (auto& t : workers) {
+        if (t.joinable()) t.join();
+    }
+    Stop();
+}
 ```
 
 ---

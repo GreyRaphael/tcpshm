@@ -127,12 +127,20 @@ class StringServer : public TSServer {
         conn.Push();
     }
 
+    // 路由与线程分工说明：
+    // 1. PollCtl() 在握手阶段依据客户端 login->use_shm 与 OnNewConnection() 返回的 grpid 分配归属分组：
+    //    - 客户端为 TCP 模式（use_shm=0）：进入 tcp_grps_[grpid]，其消息收发、心跳与断线检测均由对应的 PollTcp(now, grpid) 线程独占服务（不会进入 PollShm）。
+    //    - 客户端为 SHM 模式（use_shm=1）：进入 shm_grps_[grpid]，其业务消息（OnClientMsg）由对应的 PollShm(grpid) 线程独占服务（不会进入 PollTcp），
+    //      而 SHM 连接保活所需的 TCP 心跳由 PollCtl() 顺带轮询。
+    // 2. 无论 TCP 还是 SHM，接入握手（OnNewConnection / OnClientLogon）与断线清理（OnClientDisconnected）均统一在 PollCtl() 线程执行。
+    // 3. 拆分多线程的原因：将 PollCtl() 中的 tcp_accept/mmap/VerifyShmProbe（阻塞探测最高 300ms）与 PollTcp() 系统调用同亚微秒级 PollShm() 热路径隔离，
+    //    并支持多分组并行扩展；若场景简单且不介意新连接握手抖动，也可在主线程单循环中依次调用 PollTcp/PollShm/PollCtl（详见 doc/interface-CN.md）。
     void Run(const char* ip, uint16_t port) {
         if (!Start(ip, port)) return;
 
         vector<thread> threads;
         threads.reserve(ServerConf::MaxTcpGrps + ServerConf::MaxShmGrps);
-        // TCP 轮询线程
+        // TCP 轮询线程：仅服务 use_shm=0 且被路由到对应 grpid 的 TCP 客户端（含消息、心跳与断线检测）
         for (uint32_t i = 0; i < ServerConf::MaxTcpGrps; ++i) {
             threads.emplace_back([this, grpid = static_cast<int>(i)]() {
                 while (!stopped.load(std::memory_order_relaxed)) {
@@ -142,7 +150,7 @@ class StringServer : public TSServer {
             });
         }
 
-        // SHM 轮询线程
+        // SHM 轮询线程：仅服务 use_shm=1 且被路由到对应 grpid 的 SHM 客户端业务消息（不受 TCP/PollCtl 阻塞影响）
         for (uint32_t i = 0; i < ServerConf::MaxShmGrps; ++i) {
             threads.emplace_back([this, grpid = static_cast<int>(i)]() {
                 while (!stopped.load(std::memory_order_relaxed)) {
@@ -152,7 +160,7 @@ class StringServer : public TSServer {
             });
         }
 
-        // 主控制循环
+        // 主控制线程：负责新连接接入/登录/VerifyShmProbe 探测、SHM 连接的 TCP 心跳保活，以及全部连接的断线清理
         cout << "Server is running on " << ip << ":" << port << "..." << endl;
         while (!stopped.load(std::memory_order_relaxed)) {
             PollCtl(get_timestamp());
@@ -162,6 +170,7 @@ class StringServer : public TSServer {
         for (auto& t : threads) {
             if (t.joinable()) t.join();
         }
+        Stop();
         cout << "Server stopped gracefully." << endl;
     }
 };

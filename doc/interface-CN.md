@@ -278,13 +278,16 @@ public:
 ```
 
 ### 服务端线程模型与分片轮询 (`Polling Model`)
-服务端提供极佳的连接分片设计（Connection Sharding）。你可以为每个连接组指派专门的独占线程进行处理，也可以在一个单线程主循环中轮询处理全部组：
+服务端提供灵活的连接分片设计（Connection Sharding）。底层在登录阶段会根据客户端 `login->use_shm` 与 `OnNewConnection()` 返回的 `grpid` 自动完成路由：
+* **TCP 客户端 (`use_shm = false`)**：进入对应分组的 `PollTcp(now, grpid)`（负责收发、心跳与断线检测，不会进入 `PollShm`）。
+* **SHM 客户端 (`use_shm = true`)**：业务消息（`OnClientMsg`）仅进入对应分组的 `PollShm(grpid)`（不会进入 `PollTcp`），其保活用的 TCP 心跳由 `PollCtl(now)` 顺带轮询。
+* **控制面事件**：`OnNewConnection`、`OnClientLogon` 与 `OnClientDisconnected` 始终只在 `PollCtl(now)` 线程上执行。
 
 ```c++
 // 绑定 IP 和端口并启动监听
 bool Start(const char* listen_ipv4, uint16_t listen_port);
 
-// 主控制线程轮询：处理 accept 新连接、执行 SHM 探测握手验证并清理已退出的残留连接
+// 主控制线程轮询：处理 accept 新连接、执行 SHM 探测握手验证、SHM 连接 TCP 心跳及清理已退出连接
 void PollCtl(int64_t now);
 
 // 业务线程轮询指定的 TCP 连接组 ID (0 <= grpid < MaxTcpGrps)
@@ -295,6 +298,72 @@ void PollShm(int grpid);
 
 // 停止监听并安全释放所有在线连接
 void Stop();
+```
+
+#### 模式 1：简单主线程单循环轮询（Single-Thread Polling）
+* **适用场景**：开发测试、单机轻量服务、连接数很少且不介意新连接握手（`accept` / `mmap` / `VerifyShmProbe` 最长 300ms 阻塞探测）引起短暂延迟抖动的场景。
+* **特点**：零多线程开销、逻辑最简单、所有回调均在同一主线程顺序执行。
+
+```c++
+void RunSingleThread(const char* ip, uint16_t port, std::atomic<bool>& running) {
+    if (!Start(ip, port)) return;
+
+    while (running.load(std::memory_order_acquire)) {
+        int64_t ts = get_timestamp();
+        for (int i = 0; i < static_cast<int>(Conf::MaxTcpGrps); ++i) PollTcp(ts, i);
+        for (int i = 0; i < static_cast<int>(Conf::MaxShmGrps); ++i) PollShm(i);
+        PollCtl(ts);
+        std::this_thread::yield(); // 非极致延迟场景可改为微秒级 sleep_for
+    }
+    Stop();
+}
+```
+
+#### 模式 2：多线程分片轮询（Multi-Thread Sharded Polling，低延迟/生产推荐）
+* **适用场景**：高频交易（HFT）或低延迟生产环境，多分组高吞吐并发。
+* **特点**：
+  1. 将可能阻塞或进内核的操作（`PollCtl` 的 `accept` / `mmap` / 阻塞式 `VerifyShmProbe`，以及 `PollTcp` 的 socket I/O）与纯用户态亚微秒级 `PollShm` 热路径彻底隔离。
+  2. 可对每个分组线程单独绑核（CPU pinning）实现多核横向扩展。
+  3. 同步应答参考 [`server.cpp`](../server.cpp)；若需 I/O 线程与外部业务线程无锁解耦，参考 [`server_async.cpp`](../server_async.cpp)。
+
+```c++
+void RunMultiThread(const char* ip, uint16_t port, std::atomic<bool>& running) {
+    if (!Start(ip, port)) return;
+
+    std::vector<std::thread> workers;
+    workers.reserve(Conf::MaxTcpGrps + Conf::MaxShmGrps);
+
+    // TCP 工作线程：独占服务对应 grpid 的全部 TCP 客户端
+    for (int i = 0; i < static_cast<int>(Conf::MaxTcpGrps); ++i) {
+        workers.emplace_back([this, &running, grpid = i]() {
+            while (running.load(std::memory_order_acquire)) {
+                PollTcp(get_timestamp(), grpid);
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    // SHM 工作线程：独占服务对应 grpid 的全部 SHM 客户端业务消息
+    for (int i = 0; i < static_cast<int>(Conf::MaxShmGrps); ++i) {
+        workers.emplace_back([this, &running, grpid = i]() {
+            while (running.load(std::memory_order_acquire)) {
+                PollShm(grpid);
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    // 主控制线程：仅处理新连接登录/探测、SHM 连接 TCP 心跳与断线清理
+    while (running.load(std::memory_order_acquire)) {
+        PollCtl(get_timestamp());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    for (auto& t : workers) {
+        if (t.joinable()) t.join();
+    }
+    Stop();
+}
 ```
 
 ---
