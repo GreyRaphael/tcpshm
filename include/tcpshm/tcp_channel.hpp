@@ -48,13 +48,13 @@ SOFTWARE.
 
 namespace tcpshm {
 
-template<class Handler, ConfigConcept Config, template<uint32_t> class TcpPoller>
+template<class Handler, class Config, template<uint32_t> class TcpPoller>
 class Server;
 
-template<class Handler, ConfigConcept Config>
+template<class Handler, class Config>
 class TcpClient;
 
-template<class Handler, ConfigConcept Config>
+template<class Handler, class Config>
 class Client;
 
 // Dedicated persistent-TCP channel with mmap-backed sequence recovery and branchless TX/RX path.
@@ -141,11 +141,11 @@ public:
     }
 
 private:
-    template<class Handler, ConfigConcept Cfg, template<uint32_t> class TcpPoller>
+    template<class Handler, class Cfg, template<uint32_t> class TcpPoller>
     friend class Server;
-    template<class Handler, ConfigConcept Cfg>
+    template<class Handler, class Cfg>
     friend class TcpClient;
-    template<class Handler, ConfigConcept Cfg>
+    template<class Handler, class Cfg>
     friend class Client;
 
     static constexpr uint32_t kOverflowCap =
@@ -292,6 +292,10 @@ private:
         if (now_ - recv_time_ > Config::connection_timeout) [[unlikely]] {
             close_with(Error{ErrorCode::Timeout, 0});
         }
+    }
+
+    [[nodiscard]] detail::socket_t socket_fd() const noexcept {
+        return fd_to_close_;
     }
 
     [[nodiscard]] detail::socket_t pending_close_fd() const noexcept {
