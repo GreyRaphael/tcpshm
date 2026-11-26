@@ -29,6 +29,10 @@ add_executable(server server.cpp)
 target_link_libraries(server PRIVATE tcpshm::tcpshm)
 target_include_directories(server SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
+add_executable(server_async server_async.cpp)
+target_link_libraries(server_async PRIVATE tcpshm::tcpshm)
+target_include_directories(server_async SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
 enable_testing()
 add_executable(tcpshm_test tests/tcpshm_test.cpp)
 target_link_libraries(tcpshm_test PRIVATE tcpshm::tcpshm)
