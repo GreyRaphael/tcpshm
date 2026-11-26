@@ -234,7 +234,9 @@ inline int set_timeout_ms(socket_t s, int level, int optname, int timeout_ms) no
     return ::setsockopt(s, level, optname, static_cast<const void*>(&tv), sizeof(tv));
 }
 
-inline int readv_bytes(socket_t s, std::span<struct iovec> vecs) noexcept {
+using iovec = ::iovec;
+
+inline int readv_bytes(socket_t s, std::span<iovec> vecs) noexcept {
     return static_cast<int>(::readv(s, vecs.data(), static_cast<int>(vecs.size())));
 }
 
