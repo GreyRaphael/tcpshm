@@ -26,7 +26,6 @@ SOFTWARE.
 #include "ptcp_conn.h"
 #include "spsc_varq.h"
 #include "os.h"
-#include <new>
 
 namespace tcpshm {
 
@@ -67,14 +66,14 @@ public:
     // the returned address is guaranteed to be 8 byte aligned
     // return nullptr if no enough space
     MsgHeader* Alloc(uint16_t size) {
-        if(shm_sendq_) return shm_sendq_->Alloc(size);
+        if(shm_sendq_.IsAttached()) return shm_sendq_.Alloc(size);
         return ptcp_conn_.Alloc(size);
     }
 
     // submit the last msg from Alloc() and send out
     void Push() {
-        if(shm_sendq_)
-            shm_sendq_->Push();
+        if(shm_sendq_.IsAttached())
+            shm_sendq_.Push();
         else
             ptcp_conn_.Push();
     }
@@ -82,8 +81,8 @@ public:
     // for shm, same as Push
     // for tcp, don't send out immediately as we have more to push
     void PushMore() {
-        if(shm_sendq_)
-            shm_sendq_->Push();
+        if(shm_sendq_.IsAttached())
+            shm_sendq_.Push();
         else
             ptcp_conn_.PushMore();
     }
@@ -93,14 +92,14 @@ public:
     // if caller dont call Pop() later, it will get the same msg again
     // user dont need to call Front() directly as polling functions will do it
     MsgHeader* Front() {
-        if(shm_recvq_) return shm_recvq_->Front();
+        if(shm_recvq_.IsAttached()) return shm_recvq_.Front();
         return ptcp_conn_.Front();
     }
 
     // consume the msg we got from Front() or polling function
     void Pop() {
-        if(shm_recvq_)
-            shm_recvq_->Pop();
+        if(shm_recvq_.IsAttached())
+            shm_recvq_.Pop();
         else
             ptcp_conn_.Pop();
     }
@@ -135,20 +134,22 @@ private:
         if(use_shm) {
             std::string shm_send_file = std::string("/") + local_name_ + "_" + remote_name_ + ".shm";
             std::string shm_recv_file = std::string("/") + remote_name_ + "_" + local_name_ + ".shm";
-            if(!shm_sendq_) {
-                shm_sendq_ = my_mmap<SHMQ>(shm_send_file.c_str(), true, error_msg);
-                if(!shm_sendq_) return false;
+            if(!shm_sendq_.IsAttached()) {
+                SHMQLayout* send_layout = my_mmap<SHMQLayout>(shm_send_file.c_str(), true, error_msg);
+                if(!send_layout) return false;
+                shm_sendq_.Attach(send_layout);
             }
-            if(!shm_recvq_) {
-                shm_recvq_ = my_mmap<SHMQ>(shm_recv_file.c_str(), true, error_msg);
-                if(!shm_recvq_) {
+            if(!shm_recvq_.IsAttached()) {
+                SHMQLayout* recv_layout = my_mmap<SHMQLayout>(shm_recv_file.c_str(), true, error_msg);
+                if(!recv_layout) {
 #ifdef _WIN32
                     DWORD saved_err = GetLastError();
 #else
                     int saved_errno = errno;
 #endif
-                    my_munmap<SHMQ>(shm_sendq_);
-                    shm_sendq_ = nullptr;
+                    if(SHMQLayout* old_send = shm_sendq_.Detach()) {
+                        my_munmap<SHMQLayout>(old_send);
+                    }
 #ifdef _WIN32
                     SetLastError(saved_err);
 #else
@@ -156,6 +157,7 @@ private:
 #endif
                     return false;
                 }
+                shm_recvq_.Attach(recv_layout);
             }
             return true;
         }
@@ -164,7 +166,7 @@ private:
     }
 
     bool GetSeq(uint32_t* local_ack_seq, uint32_t* local_seq_start, uint32_t* local_seq_end, const char** error_msg) {
-        if(shm_sendq_) return true;
+        if(shm_sendq_.IsAttached()) return true;
         if(!ptcp_conn_.GetSeq(local_ack_seq, local_seq_start, local_seq_end)) {
             *error_msg = "Ptcp file corrupt";
             errno = 0;
@@ -174,9 +176,9 @@ private:
     }
 
     void Reset() {
-        if(shm_sendq_) {
-            new (shm_sendq_) SHMQ();
-            new (shm_recvq_) SHMQ();
+        if(shm_sendq_.IsAttached()) {
+            shm_sendq_.Reset();
+            shm_recvq_.Reset();
         }
         else {
             ptcp_conn_.Reset();
@@ -185,13 +187,11 @@ private:
 
     void Release() {
         remote_name_[0] = 0;
-        if(shm_sendq_) {
-            my_munmap<SHMQ>(shm_sendq_);
-            shm_sendq_ = nullptr;
+        if(SHMQLayout* p = shm_sendq_.Detach()) {
+            my_munmap<SHMQLayout>(p);
         }
-        if(shm_recvq_) {
-            my_munmap<SHMQ>(shm_recvq_);
-            shm_recvq_ = nullptr;
+        if(SHMQLayout* p = shm_recvq_.Detach()) {
+            my_munmap<SHMQLayout>(p);
         }
         ptcp_conn_.Release();
     }
@@ -211,8 +211,8 @@ private:
     }
 
     MsgHeader* ShmFront() {
-        if(!shm_recvq_) return nullptr;
-        return shm_recvq_->Front();
+        if(!shm_recvq_.IsAttached()) return nullptr;
+        return shm_recvq_.Front();
     }
 
 private:
@@ -220,8 +220,9 @@ private:
     char remote_name_[Conf::NameSize];
     const char* ptcp_dir_ = nullptr;
     PTCPConnection<Conf> ptcp_conn_;
-    using SHMQ = SPSCVarQueue<Conf::ShmQueueSize>;
-    alignas(64) SHMQ* shm_sendq_ = nullptr;
-    SHMQ* shm_recvq_ = nullptr;
+    using SHMQLayout = SPSCVarQueueLayout<Conf::ShmQueueSize>;
+    using SHMQHandle = SPSCVarQueueHandle<Conf::ShmQueueSize>;
+    alignas(64) SHMQHandle shm_sendq_;
+    SHMQHandle shm_recvq_;
 };
 } // namespace tcpshm

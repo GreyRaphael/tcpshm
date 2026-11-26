@@ -627,6 +627,112 @@ void test_server_integration(const std::string& dir, CleanupGuard& guard) {
     rsrv.Stop();
 }
 
+void test_spsc_layout_handle_and_blksz() {
+    using DefaultLayout = SPSCVarQueueLayout<4096>;
+    using CompactLayout = SPSCVarQueueLayout<256, 16>;
+    static_assert(std::is_trivial_v<DefaultLayout> && std::is_standard_layout_v<DefaultLayout>);
+    static_assert(std::is_trivial_v<CompactLayout> && std::is_standard_layout_v<CompactLayout>);
+
+    // Verify BlkSz=16 compact packing (16 * 16B = 256B) and consumer write_idx_cach_ batch drain
+    auto compact = std::make_unique<SPSCVarQueue<256, 16>>();
+    for (uint32_t i = 0; i < 16; ++i) {
+        MsgHeader* h = compact->Alloc(8);
+        TEST_CHECK(h != nullptr);
+        h->msg_type = static_cast<uint16_t>(i + 1);
+        std::memcpy(h + 1, &i, sizeof(i));
+        compact->Push();
+    }
+    TEST_CHECK(compact->Alloc(8) == nullptr);
+    for (uint32_t i = 0; i < 16; ++i) {
+        MsgHeader* h = compact->Front();
+        TEST_CHECK(h != nullptr && h->size == 16 && h->msg_type == static_cast<uint16_t>(i + 1));
+        uint32_t val = 0;
+        std::memcpy(&val, h + 1, sizeof(val));
+        TEST_CHECK(val == i);
+        compact->Pop();
+    }
+    TEST_CHECK(compact->Front() == nullptr);
+
+    // Wrap-around across ring end with BlkSz=16
+    MsgHeader* w1 = compact->Alloc(200);
+    TEST_CHECK(w1 != nullptr);
+    w1->msg_type = 1;
+    compact->Push();
+    TEST_CHECK(compact->Front() != nullptr);
+    compact->Pop();
+    MsgHeader* w2 = compact->Alloc(120);
+    TEST_CHECK(w2 != nullptr);
+    w2->msg_type = 2;
+    std::memset(w2 + 1, 0x5C, 120);
+    compact->Push();
+    MsgHeader* r2 = compact->Front();
+    TEST_CHECK(r2 != nullptr && r2->size == 128 && r2->msg_type == 2);
+    const auto* bytes = reinterpret_cast<const unsigned char*>(r2 + 1);
+    for (size_t k = 0; k < 120; ++k) TEST_CHECK(bytes[k] == 0x5C);
+    compact->Pop();
+    TEST_CHECK(compact->Front() == nullptr);
+
+    // Separate Producer/Consumer handles attached to a shared POD layout (including detach/re-attach)
+    auto shared_layout = std::make_unique<DefaultLayout>();
+    SPSCVarQueueHandle<4096> prod_h;
+    SPSCVarQueueHandle<4096> cons_h;
+    prod_h.Attach(shared_layout.get());
+    cons_h.Attach(shared_layout.get());
+    prod_h.Reset();
+    cons_h.Attach(shared_layout.get());
+
+    for (uint32_t i = 0; i < 10; ++i) {
+        MsgHeader* h = prod_h.Alloc(sizeof(i));
+        TEST_CHECK(h != nullptr);
+        h->msg_type = 3;
+        std::memcpy(h + 1, &i, sizeof(i));
+        prod_h.Push();
+    }
+    // Re-attach fresh consumer handle to simulate process restart on existing SHM layout
+    cons_h.Detach();
+    SPSCVarQueueHandle<4096> cons_h2;
+    cons_h2.Attach(shared_layout.get());
+    for (uint32_t i = 0; i < 10; ++i) {
+        MsgHeader* h = cons_h2.Front();
+        TEST_CHECK(h != nullptr && h->msg_type == 3);
+        uint32_t val = 0;
+        std::memcpy(&val, h + 1, sizeof(val));
+        TEST_CHECK(val == i);
+        cons_h2.Pop();
+    }
+    TEST_CHECK(cons_h2.Front() == nullptr);
+
+    // Concurrent 2-thread SPSC stress using separate Layout + Producer/Consumer handles
+    constexpr uint64_t kCount = 20000;
+    std::thread t_prod([&]() {
+        for (uint64_t i = 0; i < kCount; ++i) {
+            uint16_t payload = static_cast<uint16_t>(sizeof(uint64_t) + (i % 192));
+            MsgHeader* h = nullptr;
+            while ((h = prod_h.Alloc(payload)) == nullptr) {
+                std::this_thread::yield();
+            }
+            h->msg_type = 1;
+            std::memcpy(h + 1, &i, sizeof(i));
+            prod_h.Push();
+        }
+    });
+    std::thread t_cons([&]() {
+        for (uint64_t i = 0; i < kCount; ++i) {
+            MsgHeader* h = nullptr;
+            while ((h = cons_h2.Front()) == nullptr) {
+                std::this_thread::yield();
+            }
+            uint64_t seq = 0;
+            std::memcpy(&seq, h + 1, sizeof(seq));
+            TEST_CHECK(seq == i);
+            cons_h2.Pop();
+        }
+    });
+    t_prod.join();
+    t_cons.join();
+    TEST_CHECK(cons_h2.Front() == nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -637,6 +743,7 @@ int main() {
 
     test_alloc_overflow();
     test_spsc_wrap_and_stress();
+    test_spsc_layout_handle_and_blksz();
     test_ptcp_ack_and_sanity();
     test_ptcp_conn_front_reject(dir);
     test_partial_eagain_send_recovery(dir);
