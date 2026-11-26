@@ -33,3 +33,7 @@ enable_testing()
 add_executable(tcpshm_test tests/tcpshm_test.cpp)
 target_link_libraries(tcpshm_test PRIVATE tcpshm::tcpshm)
 add_test(NAME tcpshm_test COMMAND tcpshm_test)
+
+add_executable(tcpshm_bench benchmarks/tcpshm_bench.cpp)
+target_link_libraries(tcpshm_bench PRIVATE tcpshm::tcpshm)
+add_test(NAME tcpshm_bench_smoke COMMAND tcpshm_bench --mode=all --iters=200 --warmup=20 --sizes=16,64)

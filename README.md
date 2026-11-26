@@ -68,7 +68,18 @@ When a client connects and requests shared memory mode (`use_shm = 1`), `tcpshm`
   ctest --test-dir build --output-on-failure
   ```
 
-## Performance
+## Performance & Benchmark
+  The repository provides a zero-external-dependency C++20 benchmark suite in [`benchmarks/tcpshm_bench.cpp`](benchmarks/tcpshm_bench.cpp) (using `std::jthread`, `std::latch`, `std::format`, `std::span`, `std::ranges`, `std::bit_cast`, `std::source_location`, and `concepts`), measuring raw `SPSCVarQueue` throughput, TCP/SHM Ping-Pong RTT percentiles (P50/P99/P99.9), and pipelined echo throughput:
+
+  ```bash
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+  cmake --build build -j
+  ./build/tcpshm_bench --mode=all --iters=50000 --warmup=2000 --sizes=16,64,256,1024
+  # Optional CPU pinning: --pin-server=2 --pin-client=3
+  ```
+
+  `ctest --test-dir build --output-on-failure` also runs the quick `tcpshm_bench_smoke` check automatically.
+
   Historical same-host ping-pong RTT measurements (round-trip time = total time elapsed / number of messages processed):
 
   * RTT in **TCP** mode: **~8.8 us**

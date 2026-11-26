@@ -68,7 +68,18 @@ TCPSHM 采用纯头文件 (Header-only) 设计，提供了服务端与客户端 
   ctest --test-dir build --output-on-failure
   ```
 
-## 性能参考 (Performance)
+## 性能测试与 Benchmark (Performance & Benchmark)
+  项目提供基于 C++20 编写的零外部依赖基准测试套件 [`benchmarks/tcpshm_bench.cpp`](benchmarks/tcpshm_bench.cpp)（使用 `std::jthread`、`std::latch`、`std::format`、`std::span`、`std::ranges`、`std::bit_cast`、`std::source_location` 与 `concepts`），覆盖 `SPSCVarQueue` 原始吞吐、TCP/SHM Ping-Pong RTT 分位数（P50/P99/P99.9）及流水线回显吞吐：
+
+  ```bash
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+  cmake --build build -j
+  ./build/tcpshm_bench --mode=all --iters=50000 --warmup=2000 --sizes=16,64,256,1024
+  # 可选绑核参数：--pin-server=2 --pin-client=3
+  ```
+
+  `ctest --test-dir build --output-on-failure` 也会自动执行快速冒烟用例 `tcpshm_bench_smoke`。
+
   历史同机 Ping-Pong 往返延迟参考数据（平均单趟往返耗时 RTT = 总耗时 / 消息处理总数）：
 
   * **TCP** 环回模式 RTT：**~8.8 us**
