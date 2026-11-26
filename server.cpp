@@ -144,7 +144,7 @@ class StringServer : public TSServer {
         for (uint32_t i = 0; i < ServerConf::MaxTcpGrps; ++i) {
             threads.emplace_back([this, grpid = static_cast<int>(i)]() {
                 while (!stopped.load(std::memory_order_relaxed)) {
-                    PollTcp(get_timestamp(), grpid);
+                    PollTcp(get_timestamp(), grpid); // TCP模式下: PollTcp() -> OnServerMsg()
                     std::this_thread::yield();  // 比固定 sleep 更适合低延迟轮询
                 }
             });
@@ -154,7 +154,7 @@ class StringServer : public TSServer {
         for (uint32_t i = 0; i < ServerConf::MaxShmGrps; ++i) {
             threads.emplace_back([this, grpid = static_cast<int>(i)]() {
                 while (!stopped.load(std::memory_order_relaxed)) {
-                    PollShm(grpid);
+                    PollShm(grpid); // SHM模式下: PollShm() -> OnServerMsg()
                     std::this_thread::yield();
                 }
             });
@@ -163,7 +163,7 @@ class StringServer : public TSServer {
         // 主控制线程：负责新连接接入/登录/VerifyShmProbe 探测、SHM 连接的 TCP 心跳保活，以及全部连接的断线清理
         cout << "Server is running on " << ip << ":" << port << "..." << endl;
         while (!stopped.load(std::memory_order_relaxed)) {
-            PollCtl(get_timestamp());
+            PollCtl(get_timestamp()); // 控制线程
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
