@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC Release
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            build_type: Release
+          - name: Linux Clang Release
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+          - name: Linux GCC Debug
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+          - name: Windows VS2022 Release
+            os: windows-2022
+            cc: ""
+            cxx: ""
+            build_type: Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cc }}" ]; then
+            export CC="${{ matrix.cc }}"
+            export CXX="${{ matrix.cxx }}"
+          fi
+          cmake -S . -B .build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build .build --config ${{ matrix.build_type }} -j 4
+
+      - name: Run CTest
+        shell: bash
+        run: ctest --test-dir .build -C ${{ matrix.build_type }} --output-on-failure
+
+      - name: Benchmark Smoke Run
+        if: matrix.os == 'ubuntu-latest' && matrix.cxx == 'g++' && matrix.build_type == 'Release'
+        shell: bash
+        run: ./.build/benchmarks/tcpshm_bench --mode=all --iters=200 --warmup=20 --sizes=16,64
+
+      - name: Standalone & -fno-exceptions Compile Check
+        if: matrix.os == 'ubuntu-latest' && matrix.build_type == 'Release'
+        shell: bash
+        run: |
+          cat <<'EOF' | ${{ matrix.cxx }} -std=c++20 -O2 -fno-exceptions -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror -Iinclude -x c++ - -pthread -lrt -o /tmp/tcpshm_standalone_check
+          #include "tcpshm/tcpshm.hpp"
+
+          struct NoExceptHandler
+          {
+              void on_message(auto&, tcpshm::MsgView) noexcept {}
+              void on_server_msg(tcpshm::MsgView) noexcept {}
+          };
+
+          void verify_noexcept_instantiations() {
+              NoExceptHandler h;
+              tcpshm::SpscQueue<1024> sq;
+              tcpshm::PtcpQueue<1024> pq;
+              (void)sq;
+              (void)pq;
+
+              tcpshm::Server<NoExceptHandler, tcpshm::DefaultConfig, tcpshm::BusyPoller> srv_busy(h, "srv1", "/tmp");
+              tcpshm::Server<NoExceptHandler, tcpshm::DefaultConfig, tcpshm::EpollPoller> srv_ep(h, "srv2", "/tmp");
+              tcpshm::ShmClient<NoExceptHandler> sc(h, "sc", "/tmp");
+              tcpshm::TcpClient<NoExceptHandler> tc(h, "tc", "/tmp");
+              tcpshm::Client<NoExceptHandler> uc(h, "uc", "/tmp");
+              (void)srv_busy;
+              (void)srv_ep;
+              (void)sc;
+              (void)tc;
+              (void)uc;
+          }
+
+          int main(int argc, char**) {
+              if (argc < 0) verify_noexcept_instantiations();
+              tcpshm::SpscQueue<1024> q;
+              if (auto tx = q.try_alloc(tcpshm::kFirstAppMsgType, 4)) {
+                  tx->write_pod(uint32_t{42});
+                  tx->commit();
+              }
+              auto rx = q.try_front();
+              return (rx && rx->read_as<uint32_t>() == 42u) ? 0 : 1;
+          }
+          EOF
+          /tmp/tcpshm_standalone_check

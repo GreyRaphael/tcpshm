@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Build and Tests
+        run: |
+          cmake -S . -B .build -DCMAKE_BUILD_TYPE=Release
+          cmake --build .build -j 4
+          ctest --test-dir .build --output-on-failure
+
+      - name: Generate Chinese Changelog
+        id: changelog
+        run: |
+          python3 - <<'PYEOF'
+          import os, re, subprocess
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          prev_tag = ""
+          try:
+              prev_tag = git("describe", "--tags", "--abbrev=0", f"{tag}^")
+          except subprocess.CalledProcessError:
+              prev_tag = ""
+
+          if prev_tag:
+              log_args = ["log", f"{prev_tag}..{tag}", "--no-merges", "--pretty=format:%h\t%s"]
+          else:
+              log_args = ["log", tag, "--no-merges", "--max-count=30", "--pretty=format:%h\t%s"]
+
+          log_lines = git(*log_args).splitlines()
+
+          groups = [
+              ("✨ 新特性", ["feat"]),
+              ("🐛 问题修复", ["fix"]),
+              ("⚡ 性能优化", ["perf"]),
+              ("♻️ 重构与构建", ["refactor", "build", "ci"]),
+              ("📝 文档与测试", ["docs", "test"]),
+              ("📦 其他变更", ["chore", "style", "other"]),
+          ]
+          buckets = {title: [] for title, _ in groups}
+
+          for line in log_lines:
+              if not line:
+                  continue
+              sha, subj = line.split("\t", 1)
+              m = re.match(r"^([a-zA-Z]+)(?:\([^)]+\))?:\s*(.+)$", subj)
+              placed = False
+              if m:
+                  kind = m.group(1).lower()
+                  for title, prefixes in groups:
+                      if kind in prefixes:
+                          buckets[title].append(f"- {subj} (`{sha}`)")
+                          placed = True
+                          break
+              if not placed:
+                  buckets["📦 其他变更"].append(f"- {subj} (`{sha}`)")
+
+          out = [f"# tcpshm {tag} 发布说明\n"]
+          out.append("纯 C++20 Header-Only 高性能共享内存 (SHM) IPC 与持久化 TCP 消息队列框架（支持 Linux 与 Windows）。\n")
+          for title, _ in groups:
+              items = buckets[title]
+              if items:
+                  out.append(f"## {title}\n")
+                  out.extend(items)
+                  out.append("")
+
+          out.append("## 📦 快速集成\n")
+          out.append("- **直接拷贝头文件**：下载下方附件 `tcpshm-" + tag + "-headers.tar.gz`（或 `.zip`）解压至项目 `third_party/` 目录即可使用；")
+          out.append("- **CMake 子目录 / FetchContent**：")
+          out.append("```cmake")
+          out.append("add_subdirectory(tcpshm)")
+          out.append("target_link_libraries(your_app PRIVATE tcpshm::tcpshm)")
+          out.append("```\n")
+
+          if prev_tag:
+              out.append(f"**完整提交对比**：[`{prev_tag}...{tag}`](https://github.com/{repo}/compare/{prev_tag}...{tag})\n")
+
+          with open("release_notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(out))
+          PYEOF
+
+      - name: Package Header-Only Bundle
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p "dist/${TAG}/third_party"
+          cp -r include/tcpshm "dist/${TAG}/third_party/"
+          cp README.md README-CN.md LICENSE* "dist/${TAG}/" 2>/dev/null || true
+          tar -czf "tcpshm-${TAG}-headers.tar.gz" -C "dist/${TAG}" .
+          (cd "dist/${TAG}" && zip -rq "../../tcpshm-${TAG}-headers.zip" .)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "${TAG}" \
+            "tcpshm-${TAG}-headers.tar.gz" \
+            "tcpshm-${TAG}-headers.zip" \
+            --title "tcpshm ${TAG}" \
+            --notes-file release_notes.md
