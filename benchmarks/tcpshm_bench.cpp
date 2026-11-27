@@ -250,6 +250,7 @@ struct BenchOptions
     std::vector<uint32_t> sizes = {16u, 64u, 256u, 1024u};
     int pin_server = -1;
     int pin_client = -1;
+    int pin_recv = -1;
 };
 
 struct LatencyStats
@@ -430,9 +431,8 @@ LatencyStats run_rtt_case(const std::string& dir,
     std::jthread worker_thr([&](std::stop_token st) {
         pin_current_thread(pin_server);
         while (!st.stop_requested()) {
-            if (use_shm) srv.poll_shm(0, 1);
-            else srv.poll_tcp(steady_now(), 0, 1);
-            cpu_relax();
+            const uint32_t n = use_shm ? srv.poll_shm(0, 1) : srv.poll_tcp(steady_now(), 0, 1);
+            if (n == 0) cpu_relax();
         }
     });
     srv_ready.wait();
@@ -452,7 +452,6 @@ LatencyStats run_rtt_case(const std::string& dir,
         });
     }
 
-    pin_current_thread(pin_client);
     cli_h.reset_counter();
 
     const uint32_t sz = payload_size;
@@ -460,38 +459,40 @@ LatencyStats run_rtt_case(const std::string& dir,
     std::vector<uint64_t> samples_ns(iters);
     uint64_t measured_ns = 0;
 
-    for (uint64_t seq = 0; seq < total; ++seq) {
-        const auto t_start = steady_now();
-        cli.with_channel([&](auto& ch) {
-            while (true) {
-                auto tx = ch.try_alloc(1, sz);
-                if (tx) {
-                    write_seq_payload(tx->data(), seq);
-                    tx->commit();
-                    break;
+    std::jthread client_thr([&](std::stop_token) {
+        pin_current_thread(pin_client);
+        for (uint64_t seq = 0; seq < total; ++seq) {
+            const auto t_start = steady_now();
+            cli.with_channel([&](auto& ch) {
+                while (true) {
+                    auto tx = ch.try_alloc(1, sz);
+                    if (tx) {
+                        write_seq_payload(tx->data(), seq);
+                        tx->commit();
+                        break;
+                    }
+                    bench_check(!cli.is_closed(), "client closed during try_alloc");
+                    const uint32_t n = use_shm ? cli.poll_shm(1) : cli.poll_tcp(steady_now(), 1);
+                    if (n == 0) cpu_relax();
                 }
-                bench_check(!cli.is_closed(), "client closed during try_alloc");
-                if (use_shm) cli.poll_shm(1);
-                else cli.poll_tcp(steady_now(), 1);
-                cpu_relax();
-            }
-        });
+            });
 
-        const uint64_t target = seq + 1;
-        while (cli_h.recv_count() < target) {
-            bench_check(!cli.is_closed(), "client closed waiting for echo");
-            if (use_shm) cli.poll_shm(1);
-            else cli.poll_tcp(steady_now(), 1);
-            cpu_relax();
+            const uint64_t target = seq + 1;
+            while (cli_h.recv_count() < target) {
+                bench_check(!cli.is_closed(), "client closed waiting for echo");
+                const uint32_t n = use_shm ? cli.poll_shm(1) : cli.poll_tcp(steady_now(), 1);
+                if (n == 0) cpu_relax();
+            }
+            const auto t_end = steady_now();
+            if (seq >= warmup) {
+                const uint64_t rtt = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count());
+                samples_ns[seq - warmup] = rtt;
+                measured_ns += rtt;
+            }
         }
-        const auto t_end = steady_now();
-        if (seq >= warmup) {
-            const uint64_t rtt = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count());
-            samples_ns[seq - warmup] = rtt;
-            measured_ns += rtt;
-        }
-    }
+    });
+    client_thr.join();
 
     if (cli_hb_thr.joinable()) {
         cli_hb_thr.request_stop();
@@ -517,7 +518,8 @@ ThroughputStats run_throughput_case(const std::string& dir,
                                     uint32_t warmup,
                                     uint32_t iters,
                                     int pin_server,
-                                    int pin_client) {
+                                    int pin_client,
+                                    int pin_recv) {
     const int pid = current_pid();
     const std::string srv_name = make_name("ts", pid, run_id);
     const std::string cli_name = make_name("tc", pid, run_id);
@@ -541,12 +543,9 @@ ThroughputStats run_throughput_case(const std::string& dir,
         pin_current_thread(pin_server);
         const uint32_t batch_lim = batch_mode ? 32u : 1u;
         while (!st.stop_requested()) {
-            if (use_shm) {
-                srv.poll_shm(0, batch_lim);
-            } else {
-                srv.poll_tcp(steady_now(), 0, batch_lim);
-            }
-            cpu_relax();
+            const uint32_t n = use_shm ? srv.poll_shm(0, batch_lim)
+                                       : srv.poll_tcp(steady_now(), 0, batch_lim);
+            if (n == 0) cpu_relax();
         }
     });
     srv_ready.wait();
@@ -559,7 +558,7 @@ ThroughputStats run_throughput_case(const std::string& dir,
 
     const uint32_t sz = payload_size;
     const uint64_t total = static_cast<uint64_t>(warmup) + static_cast<uint64_t>(iters);
-    std::atomic<uint64_t> measure_start_ns{0};
+    uint64_t measure_start_ns = 0;
     uint64_t measure_end_ns = 0;
 
     if (use_shm) {
@@ -571,15 +570,16 @@ ThroughputStats run_throughput_case(const std::string& dir,
             }
         });
         std::jthread recv_thr([&](std::stop_token) {
+            pin_current_thread(pin_recv);
             start_gate.arrive_and_wait();
             const uint32_t rx_batch = batch_mode ? 32u : 1u;
             while (cli_h.recv_count() < total) {
                 bench_check(!cli.is_closed(), "SHM client closed in throughput recv");
-                cli.poll_shm(rx_batch);
-                if (measure_start_ns.load(std::memory_order_acquire) == 0 && cli_h.recv_count() >= warmup) {
-                    measure_start_ns.store(now_ns_u64(), std::memory_order_release);
+                const uint32_t n = cli.poll_shm(rx_batch);
+                if (measure_start_ns == 0 && cli_h.recv_count() >= warmup) {
+                    measure_start_ns = now_ns_u64();
                 }
-                cpu_relax();
+                if (n == 0) cpu_relax();
             }
             measure_end_ns = now_ns_u64();
         });
@@ -626,31 +626,34 @@ ThroughputStats run_throughput_case(const std::string& dir,
         hb_thr.request_stop();
         hb_thr.join();
     } else {
-        pin_current_thread(pin_client);
-        auto& ch = cli.tcp_channel();
-        uint64_t sent = 0;
-        while (cli_h.recv_count() < total) {
-            bench_check(!cli.is_closed(), "TCP client closed in throughput");
-            uint32_t batch = 0;
-            while (sent < total && batch < 32u) {
-                auto tx = ch.try_alloc(1, sz);
-                if (!tx) break;
-                write_seq_payload(tx->data(), sent);
-                ++sent;
-                ++batch;
-                if (sent == total || batch == 32u) tx->commit();
-                else tx->stage();
+        std::jthread tcp_cli_thr([&](std::stop_token) {
+            pin_current_thread(pin_client);
+            auto& ch = cli.tcp_channel();
+            uint64_t sent = 0;
+            while (cli_h.recv_count() < total) {
+                bench_check(!cli.is_closed(), "TCP client closed in throughput");
+                uint32_t batch = 0;
+                while (sent < total && batch < 32u) {
+                    auto tx = ch.try_alloc(1, sz);
+                    if (!tx) break;
+                    write_seq_payload(tx->data(), sent);
+                    ++sent;
+                    ++batch;
+                    if (sent == total || batch == 32u) tx->commit();
+                    else tx->stage();
+                }
+                uint64_t prev_recv;
+                do {
+                    prev_recv = cli_h.recv_count();
+                    cli.poll_tcp(steady_now(), 32u);
+                } while (cli_h.recv_count() > prev_recv && cli_h.recv_count() < total);
+                if (measure_start_ns == 0 && cli_h.recv_count() >= warmup) {
+                    measure_start_ns = now_ns_u64();
+                }
             }
-            uint64_t prev_recv;
-            do {
-                prev_recv = cli_h.recv_count();
-                cli.poll_tcp(steady_now(), 32u);
-            } while (cli_h.recv_count() > prev_recv && cli_h.recv_count() < total);
-            if (measure_start_ns.load(std::memory_order_relaxed) == 0 && cli_h.recv_count() >= warmup) {
-                measure_start_ns.store(now_ns_u64(), std::memory_order_relaxed);
-            }
-        }
-        measure_end_ns = now_ns_u64();
+            measure_end_ns = now_ns_u64();
+        });
+        tcp_cli_thr.join();
     }
 
     cli.stop();
@@ -660,8 +663,7 @@ ThroughputStats run_throughput_case(const std::string& dir,
     ctl_thr.join();
     srv.stop();
 
-    const uint64_t t0 = measure_start_ns.load(std::memory_order_acquire);
-    const uint64_t elapsed = (measure_end_ns > t0) ? (measure_end_ns - t0) : 1u;
+    const uint64_t elapsed = (measure_end_ns > measure_start_ns) ? (measure_end_ns - measure_start_ns) : 1u;
     const double sec = static_cast<double>(elapsed) / 1e9;
     const double msg_s = static_cast<double>(iters) / sec;
     return ThroughputStats{
@@ -692,7 +694,8 @@ void print_usage(std::string_view prog) {
         "  --warmup=<N>                     Warmup messages per case (default: 2000)\n"
         "  --sizes=16,64,256,1024           Comma-separated payload sizes in bytes (8..{})\n"
         "  --pin-server=<core>              Pin server worker thread to CPU core (-1 = unpinned)\n"
-        "  --pin-client=<core>              Pin client worker thread to CPU core (-1 = unpinned)\n"
+        "  --pin-client=<core>              Pin client sender/worker thread to CPU core (-1 = unpinned)\n"
+        "  --pin-recv=<core>                Pin SHM throughput receiver thread to CPU core (-1 = unpinned)\n"
         "  --help, -h                       Show this message\n",
         prog,
         BenchConfig::tcp_recv_max_bytes - sizeof(FrameHeader));
@@ -735,6 +738,8 @@ bool parse_args(int argc, char** argv, BenchOptions& opts) {
             if (!parse_i32(arg.substr(13), opts.pin_server)) return false;
         } else if (arg.starts_with("--pin-client=")) {
             if (!parse_i32(arg.substr(13), opts.pin_client)) return false;
+        } else if (arg.starts_with("--pin-recv=")) {
+            if (!parse_i32(arg.substr(11), opts.pin_recv)) return false;
         } else {
             return false;
         }
@@ -759,13 +764,14 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(dir);
 
     std::cout << std::format(
-        "tcpshm v2.0 C++20 (16B Header) Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={})\n",
+        "tcpshm v2.0 C++20 (16B Header) Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={}, recv={})\n",
         opts.iters,
         opts.warmup,
         BenchConfig::shm_queue_bytes / 1024u,
         BenchConfig::tcp_queue_bytes / 1024u,
         opts.pin_server,
-        opts.pin_client);
+        opts.pin_client,
+        opts.pin_recv);
 
     uint32_t run_id = 1;
 
@@ -824,24 +830,24 @@ int main(int argc, char** argv) {
         std::cout << std::string(60, '-') << '\n';
         for (uint32_t sz : opts.sizes) {
             auto tcp_busy = run_throughput_case<BusyPoller>(dir, guard, run_id++, false, true, sz,
-                                                            opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+                                                            opts.warmup, opts.iters, opts.pin_server, opts.pin_client, opts.pin_recv);
             std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
                                      "TCP-Busy", sz, tcp_busy.msg_per_sec, tcp_busy.mb_per_sec, tcp_busy.ns_per_msg);
 
 #ifdef __linux__
             auto tcp_ep = run_throughput_case<EpollPoller>(dir, guard, run_id++, false, true, sz,
-                                                           opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+                                                           opts.warmup, opts.iters, opts.pin_server, opts.pin_client, opts.pin_recv);
             std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
                                      "TCP-Epoll", sz, tcp_ep.msg_per_sec, tcp_ep.mb_per_sec, tcp_ep.ns_per_msg);
 #endif
 
             auto shm_1 = run_throughput_case<BusyPoller>(dir, guard, run_id++, true, false, sz,
-                                                         opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+                                                         opts.warmup, opts.iters, opts.pin_server, opts.pin_client, opts.pin_recv);
             std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
                                      "SHM-1by1", sz, shm_1.msg_per_sec, shm_1.mb_per_sec, shm_1.ns_per_msg);
 
             auto shm_b = run_throughput_case<BusyPoller>(dir, guard, run_id++, true, true, sz,
-                                                         opts.warmup, opts.iters, opts.pin_server, opts.pin_client);
+                                                         opts.warmup, opts.iters, opts.pin_server, opts.pin_client, opts.pin_recv);
             std::cout << std::format("{:<11} {:>7} {:>14.0f} {:>12.2f} {:>12.1f}\n",
                                      "SHM-Batch", sz, shm_b.msg_per_sec, shm_b.mb_per_sec, shm_b.ns_per_msg);
         }

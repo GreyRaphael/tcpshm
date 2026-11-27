@@ -47,9 +47,12 @@ struct SpscRingLayout
     static constexpr uint32_t kHdrSz = kFrameHeaderSize;
     static_assert(kBlkSz >= kHdrSz && (kBlkSz % kHdrSz == 0) && std::has_single_bit(kBlkSz),
                   "BlkSz must be a power-of-2 multiple of 16");
+    static_assert(kBlkSz <= kMaxFrameSize, "BlkSz exceeds kMaxFrameSize");
     static_assert(Bytes >= kBlkSz && Bytes % kBlkSz == 0, "Bytes must be a positive multiple of BlkSz");
     static constexpr uint32_t kBlkCnt = Bytes / kBlkSz;
     static_assert(kBlkCnt > 0 && std::has_single_bit(kBlkCnt), "kBlkCnt must be a power of 2");
+    static constexpr uint32_t kMaxQueueFrameSize = (Bytes < kMaxFrameSize) ? Bytes : kMaxFrameSize;
+    static constexpr uint32_t kMaxQueuePayloadSize = kMaxQueueFrameSize - kHdrSz;
     static_assert(std::atomic_ref<uint32_t>::is_always_lock_free,
                   "std::atomic_ref<uint32_t> must be lock-free");
 
@@ -68,6 +71,8 @@ public:
     static constexpr uint32_t kBlkSz = Layout::kBlkSz;
     static constexpr uint32_t kBlkCnt = Layout::kBlkCnt;
     static constexpr uint32_t kHdrSz = Layout::kHdrSz;
+    static constexpr uint32_t kMaxQueueFrameSize = Layout::kMaxQueueFrameSize;
+    static constexpr uint32_t kMaxQueuePayloadSize = Layout::kMaxQueuePayloadSize;
     static_assert(std::is_trivial_v<Layout> && std::is_standard_layout_v<Layout>,
                   "SpscRingLayout must be trivial and standard-layout");
 
@@ -123,14 +128,11 @@ public:
 
     [[nodiscard]] std::optional<Guard> try_alloc(uint16_t msg_type, uint32_t payload_size) noexcept {
         pending_blk_sz_ = 0;
-        if (!layout_ || payload_size > kMaxPayloadSize) [[unlikely]] {
+        if (!layout_ || payload_size > kMaxQueuePayloadSize) [[unlikely]] {
             return std::nullopt;
         }
         const uint32_t total_size = payload_size + kHdrSz;
-        const uint32_t blk_sz = (total_size - 1u) / kBlkSz + 1u;
-        if (blk_sz > kBlkCnt) [[unlikely]] {
-            return std::nullopt;
-        }
+        const uint32_t blk_sz = (total_size + kBlkSz - 1u) / kBlkSz;
         uint32_t local_write = local_write_idx_;
         const uint32_t padding_sz = kBlkCnt - (local_write & (kBlkCnt - 1u));
         const bool rewind = blk_sz > padding_sz;
@@ -203,6 +205,8 @@ public:
     static constexpr uint32_t kBlkSz = Layout::kBlkSz;
     static constexpr uint32_t kBlkCnt = Layout::kBlkCnt;
     static constexpr uint32_t kHdrSz = Layout::kHdrSz;
+    static constexpr uint32_t kMaxQueueFrameSize = Layout::kMaxQueueFrameSize;
+    static constexpr uint32_t kMaxQueuePayloadSize = Layout::kMaxQueuePayloadSize;
     static_assert(std::is_trivial_v<Layout> && std::is_standard_layout_v<Layout>,
                   "SpscRingLayout must be trivial and standard-layout");
 
@@ -285,10 +289,10 @@ public:
                 local_read += kBlkCnt - slot;
                 continue;
             }
-            if (hdr.size < kHdrSz || hdr.size > kMaxFrameSize) [[unlikely]] {
+            if (hdr.size < kHdrSz || hdr.size > kMaxQueueFrameSize) [[unlikely]] {
                 break;
             }
-            const uint32_t blk_sz = (hdr.size - 1u) / kBlkSz + 1u;
+            const uint32_t blk_sz = (hdr.size + kBlkSz - 1u) / kBlkSz;
             const uint32_t avail_blks = write_cache - local_read;
             if (blk_sz > avail_blks || blk_sz > kBlkCnt - slot) [[unlikely]] {
                 break;
@@ -342,10 +346,10 @@ private:
             slot = local_read & (kBlkCnt - 1u);
             std::memcpy(&hdr, layout_->buf + static_cast<size_t>(slot) * kBlkSz, sizeof(FrameHeader));
         }
-        if (hdr.size < kHdrSz || hdr.size > kMaxFrameSize) [[unlikely]] {
+        if (hdr.size < kHdrSz || hdr.size > kMaxQueueFrameSize) [[unlikely]] {
             return nullptr;
         }
-        const uint32_t blk_sz = (hdr.size - 1u) / kBlkSz + 1u;
+        const uint32_t blk_sz = (hdr.size + kBlkSz - 1u) / kBlkSz;
         const uint32_t avail_blks = write_idx_cache_ - local_read;
         if (blk_sz > avail_blks || blk_sz > kBlkCnt - slot) [[unlikely]] {
             return nullptr;
@@ -372,6 +376,8 @@ public:
     static constexpr uint32_t kBlkSz = Layout::kBlkSz;
     static constexpr uint32_t kBlkCnt = Layout::kBlkCnt;
     static constexpr uint32_t kHdrSz = Layout::kHdrSz;
+    static constexpr uint32_t kMaxQueueFrameSize = Layout::kMaxQueueFrameSize;
+    static constexpr uint32_t kMaxQueuePayloadSize = Layout::kMaxQueuePayloadSize;
 
     SpscQueue() noexcept {
         prod_.attach(&layout_);
