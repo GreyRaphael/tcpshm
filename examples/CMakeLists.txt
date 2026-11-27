@@ -1,0 +1,10 @@
+function(tcpshm_add_example target src)
+  add_executable(${target} ${src})
+  target_link_libraries(${target} PRIVATE tcpshm::tcpshm)
+  target_include_directories(${target} SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party")
+  target_compile_features(${target} PRIVATE cxx_std_20)
+endfunction()
+
+tcpshm_add_example(echo_client       echo_client.cpp)
+tcpshm_add_example(echo_server       echo_server.cpp)
+tcpshm_add_example(echo_server_async echo_server_async.cpp)
