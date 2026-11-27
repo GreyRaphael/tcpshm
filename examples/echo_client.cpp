@@ -126,7 +126,7 @@ private:
             print_line("Message too large!");
             return;
         }
-        auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, static_cast<uint16_t>(out.size()));
+        auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, static_cast<uint32_t>(out.size()));
         if (!tx) {
             print_line("Send buffer full!");
             return;

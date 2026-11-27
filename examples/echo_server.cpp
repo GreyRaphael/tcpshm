@@ -82,7 +82,7 @@ private:
         std::string rsp_body;
         iguana::to_pb(rsp, rsp_body);
         if (rsp_body.size() > tcpshm::kMaxPayloadSize) return;
-        if (auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, static_cast<uint16_t>(rsp_body.size()))) {
+        if (auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, static_cast<uint32_t>(rsp_body.size()))) {
             tx->write_str(rsp_body);
             tx->commit();
         }

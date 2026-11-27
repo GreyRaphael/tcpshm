@@ -24,9 +24,12 @@ SOFTWARE.
 
 #pragma once
 
+#include <concepts>
 #include <cstdint>
-#include <expected>
+#include <memory>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 
 namespace tcpshm {
 
@@ -132,13 +135,254 @@ struct Error
     }
 };
 
+// Pure C++20 exception-free Unexpected/Expected implementation (replaces std::expected).
+template<typename E>
+class Unexpected
+{
+public:
+    constexpr explicit Unexpected(const E& err) noexcept(std::is_nothrow_copy_constructible_v<E>)
+        : err_(err) {}
+    constexpr explicit Unexpected(E&& err) noexcept(std::is_nothrow_move_constructible_v<E>)
+        : err_(std::move(err)) {}
+
+    [[nodiscard]] constexpr const E& error() const& noexcept { return err_; }
+    [[nodiscard]] constexpr E& error() & noexcept { return err_; }
+    [[nodiscard]] constexpr E&& error() && noexcept { return std::move(err_); }
+
+private:
+    E err_;
+};
+
+template<typename T, typename E = Error>
+class Expected
+{
+public:
+    using value_type = T;
+    using error_type = E;
+
+    constexpr Expected() noexcept(std::is_nothrow_default_constructible_v<T>)
+        requires std::is_default_constructible_v<T>
+        : val_(), has_val_(true) {}
+
+    template<typename U = T>
+        requires (!std::same_as<std::decay_t<U>, Expected> &&
+                  !std::same_as<std::decay_t<U>, Unexpected<E>> &&
+                  std::convertible_to<U, T>)
+    constexpr Expected(U&& val) noexcept(std::is_nothrow_constructible_v<T, U>)
+        : val_(std::forward<U>(val)), has_val_(true) {}
+
+    template<typename G>
+        requires std::convertible_to<const G&, E>
+    constexpr Expected(const Unexpected<G>& u) noexcept(std::is_nothrow_constructible_v<E, const G&>)
+        : err_(u.error()), has_val_(false) {}
+
+    template<typename G>
+        requires std::convertible_to<G, E>
+    constexpr Expected(Unexpected<G>&& u) noexcept(std::is_nothrow_constructible_v<E, G&&>)
+        : err_(std::move(u.error())), has_val_(false) {}
+
+    constexpr Expected(const Expected& other) noexcept(
+        std::is_nothrow_copy_constructible_v<T> && std::is_nothrow_copy_constructible_v<E>)
+        requires (std::is_trivially_copy_constructible_v<T> && std::is_trivially_copy_constructible_v<E>)
+        = default;
+
+    constexpr Expected(const Expected& other) noexcept(
+        std::is_nothrow_copy_constructible_v<T> && std::is_nothrow_copy_constructible_v<E>)
+        : has_val_(other.has_val_) {
+        if (has_val_) std::construct_at(std::addressof(val_), other.val_);
+        else std::construct_at(std::addressof(err_), other.err_);
+    }
+
+    constexpr Expected(Expected&& other) noexcept(
+        std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_constructible_v<E>)
+        requires (std::is_trivially_move_constructible_v<T> && std::is_trivially_move_constructible_v<E>)
+        = default;
+
+    constexpr Expected(Expected&& other) noexcept(
+        std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_constructible_v<E>)
+        : has_val_(other.has_val_) {
+        if (has_val_) std::construct_at(std::addressof(val_), std::move(other.val_));
+        else std::construct_at(std::addressof(err_), std::move(other.err_));
+    }
+
+    constexpr ~Expected() noexcept
+        requires (std::is_trivially_destructible_v<T> && std::is_trivially_destructible_v<E>)
+        = default;
+
+    constexpr ~Expected() noexcept {
+        if (has_val_) std::destroy_at(std::addressof(val_));
+        else std::destroy_at(std::addressof(err_));
+    }
+
+    constexpr Expected& operator=(const Expected& other) noexcept(
+        std::is_nothrow_copy_constructible_v<T> && std::is_nothrow_copy_assignable_v<T> &&
+        std::is_nothrow_copy_constructible_v<E> && std::is_nothrow_copy_assignable_v<E>) {
+        if (this == &other) return *this;
+        if (has_val_ && other.has_val_) {
+            val_ = other.val_;
+        } else if (!has_val_ && !other.has_val_) {
+            err_ = other.err_;
+        } else if (has_val_) {
+            std::destroy_at(std::addressof(val_));
+            std::construct_at(std::addressof(err_), other.err_);
+            has_val_ = false;
+        } else {
+            std::destroy_at(std::addressof(err_));
+            std::construct_at(std::addressof(val_), other.val_);
+            has_val_ = true;
+        }
+        return *this;
+    }
+
+    constexpr Expected& operator=(Expected&& other) noexcept(
+        std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T> &&
+        std::is_nothrow_move_constructible_v<E> && std::is_nothrow_move_assignable_v<E>) {
+        if (this == &other) return *this;
+        if (has_val_ && other.has_val_) {
+            val_ = std::move(other.val_);
+        } else if (!has_val_ && !other.has_val_) {
+            err_ = std::move(other.err_);
+        } else if (has_val_) {
+            std::destroy_at(std::addressof(val_));
+            std::construct_at(std::addressof(err_), std::move(other.err_));
+            has_val_ = false;
+        } else {
+            std::destroy_at(std::addressof(err_));
+            std::construct_at(std::addressof(val_), std::move(other.val_));
+            has_val_ = true;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] constexpr bool has_value() const noexcept { return has_val_; }
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return has_val_; }
+
+    [[nodiscard]] constexpr T& operator*() & noexcept { return val_; }
+    [[nodiscard]] constexpr const T& operator*() const& noexcept { return val_; }
+    [[nodiscard]] constexpr T&& operator*() && noexcept { return std::move(val_); }
+
+    [[nodiscard]] constexpr T* operator->() noexcept { return std::addressof(val_); }
+    [[nodiscard]] constexpr const T* operator->() const noexcept { return std::addressof(val_); }
+
+    [[nodiscard]] constexpr E& error() & noexcept { return err_; }
+    [[nodiscard]] constexpr const E& error() const& noexcept { return err_; }
+    [[nodiscard]] constexpr E&& error() && noexcept { return std::move(err_); }
+
+    template<typename U>
+    [[nodiscard]] constexpr T value_or(U&& default_val) const& {
+        return has_val_ ? val_ : static_cast<T>(std::forward<U>(default_val));
+    }
+
+private:
+    union
+    {
+        T val_;
+        E err_;
+    };
+    bool has_val_;
+};
+
+template<typename E>
+class Expected<void, E>
+{
+public:
+    using value_type = void;
+    using error_type = E;
+
+    constexpr Expected() noexcept : dummy_(0), has_val_(true) {}
+
+    template<typename G>
+        requires std::convertible_to<const G&, E>
+    constexpr Expected(const Unexpected<G>& u) noexcept(std::is_nothrow_constructible_v<E, const G&>)
+        : err_(u.error()), has_val_(false) {}
+
+    template<typename G>
+        requires std::convertible_to<G, E>
+    constexpr Expected(Unexpected<G>&& u) noexcept(std::is_nothrow_constructible_v<E, G&&>)
+        : err_(std::move(u.error())), has_val_(false) {}
+
+    constexpr Expected(const Expected&) noexcept(std::is_nothrow_copy_constructible_v<E>)
+        requires std::is_trivially_copy_constructible_v<E> = default;
+
+    constexpr Expected(const Expected& other) noexcept(std::is_nothrow_copy_constructible_v<E>)
+        : dummy_(0), has_val_(other.has_val_) {
+        if (!has_val_) std::construct_at(std::addressof(err_), other.err_);
+    }
+
+    constexpr Expected(Expected&&) noexcept(std::is_nothrow_move_constructible_v<E>)
+        requires std::is_trivially_move_constructible_v<E> = default;
+
+    constexpr Expected(Expected&& other) noexcept(std::is_nothrow_move_constructible_v<E>)
+        : dummy_(0), has_val_(other.has_val_) {
+        if (!has_val_) std::construct_at(std::addressof(err_), std::move(other.err_));
+    }
+
+    constexpr ~Expected() noexcept
+        requires std::is_trivially_destructible_v<E> = default;
+
+    constexpr ~Expected() noexcept {
+        if (!has_val_) std::destroy_at(std::addressof(err_));
+    }
+
+    constexpr Expected& operator=(const Expected& other) noexcept(
+        std::is_nothrow_copy_constructible_v<E> && std::is_nothrow_copy_assignable_v<E>) {
+        if (this == &other) return *this;
+        if (!has_val_ && !other.has_val_) {
+            err_ = other.err_;
+        } else if (!has_val_) {
+            std::destroy_at(std::addressof(err_));
+            dummy_ = 0;
+            has_val_ = true;
+        } else if (!other.has_val_) {
+            std::construct_at(std::addressof(err_), other.err_);
+            has_val_ = false;
+        }
+        return *this;
+    }
+
+    constexpr Expected& operator=(Expected&& other) noexcept(
+        std::is_nothrow_move_constructible_v<E> && std::is_nothrow_move_assignable_v<E>) {
+        if (this == &other) return *this;
+        if (!has_val_ && !other.has_val_) {
+            err_ = std::move(other.err_);
+        } else if (!has_val_) {
+            std::destroy_at(std::addressof(err_));
+            dummy_ = 0;
+            has_val_ = true;
+        } else if (!other.has_val_) {
+            std::construct_at(std::addressof(err_), std::move(other.err_));
+            has_val_ = false;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] constexpr bool has_value() const noexcept { return has_val_; }
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return has_val_; }
+
+    [[nodiscard]] constexpr E& error() & noexcept { return err_; }
+    [[nodiscard]] constexpr const E& error() const& noexcept { return err_; }
+    [[nodiscard]] constexpr E&& error() && noexcept { return std::move(err_); }
+
+private:
+    union
+    {
+        uint8_t dummy_;
+        E err_;
+    };
+    bool has_val_;
+};
+
 template<typename T>
-using Result = std::expected<T, Error>;
+using Result = Expected<T, Error>;
 
-using VoidResult = std::expected<void, Error>;
+using VoidResult = Expected<void, Error>;
 
-[[nodiscard]] inline std::unexpected<Error> make_error(ErrorCode code, int sys_errno = 0) noexcept {
-    return std::unexpected<Error>(Error{code, sys_errno});
+[[nodiscard]] constexpr Unexpected<Error> make_error(Error err) noexcept {
+    return Unexpected<Error>(err);
+}
+
+[[nodiscard]] constexpr Unexpected<Error> make_error(ErrorCode code, int sys_errno = 0) noexcept {
+    return Unexpected<Error>(Error{code, sys_errno});
 }
 
 } // namespace tcpshm

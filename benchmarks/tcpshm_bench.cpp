@@ -309,7 +309,7 @@ ThroughputStats run_spsc_case(bool batch_mode,
                               int pin_cons) {
     auto q = std::make_unique<SpscQueue<BenchConfig::shm_queue_bytes, BenchConfig::shm_block_bytes>>();
     const uint64_t total = static_cast<uint64_t>(warmup) + static_cast<uint64_t>(iters);
-    const uint16_t sz = static_cast<uint16_t>(payload_size);
+    const uint32_t sz = payload_size;
     std::latch ready{2};
     std::atomic<uint64_t> warmup_end_ns{0};
 
@@ -455,7 +455,7 @@ LatencyStats run_rtt_case(const std::string& dir,
     pin_current_thread(pin_client);
     cli_h.reset_counter();
 
-    const uint16_t sz = static_cast<uint16_t>(payload_size);
+    const uint32_t sz = payload_size;
     const uint64_t total = static_cast<uint64_t>(warmup) + static_cast<uint64_t>(iters);
     std::vector<uint64_t> samples_ns(iters);
     uint64_t measured_ns = 0;
@@ -557,7 +557,7 @@ ThroughputStats run_throughput_case(const std::string& dir,
                 "client connect");
     cli_h.reset_counter();
 
-    const uint16_t sz = static_cast<uint16_t>(payload_size);
+    const uint32_t sz = payload_size;
     const uint64_t total = static_cast<uint64_t>(warmup) + static_cast<uint64_t>(iters);
     std::atomic<uint64_t> measure_start_ns{0};
     uint64_t measure_end_ns = 0;
@@ -759,7 +759,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(dir);
 
     std::cout << std::format(
-        "tcpshm v2.0 C++23 Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={})\n",
+        "tcpshm v2.0 C++20 (16B Header) Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={})\n",
         opts.iters,
         opts.warmup,
         BenchConfig::shm_queue_bytes / 1024u,

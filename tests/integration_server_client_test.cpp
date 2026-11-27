@@ -47,6 +47,25 @@ struct IntTestConfig : DefaultConfig
     static constexpr std::chrono::nanoseconds heartbeat_interval = std::chrono::milliseconds(500);
 };
 
+struct LargeTestConfig : DefaultConfig
+{
+    static constexpr uint32_t name_size = 16;
+    static constexpr uint32_t shm_queue_bytes = 512u * 1024u;
+    static constexpr uint32_t shm_block_bytes = 64;
+    static constexpr uint32_t tcp_queue_bytes = 256u * 1024u;
+    static constexpr uint32_t tcp_recv_init_bytes = 4096;
+    static constexpr uint32_t tcp_recv_max_bytes = 256u * 1024u;
+    static constexpr uint32_t max_shm_groups = 1;
+    static constexpr uint32_t max_shm_conns_per_group = 2;
+    static constexpr uint32_t max_tcp_groups = 1;
+    static constexpr uint32_t max_tcp_conns_per_group = 2;
+    static constexpr uint32_t max_pending_conns = 4;
+    static constexpr uint32_t poll_batch_size = 16;
+    static constexpr std::chrono::nanoseconds handshake_timeout = std::chrono::seconds(2);
+    static constexpr std::chrono::nanoseconds connection_timeout = std::chrono::seconds(3);
+    static constexpr std::chrono::nanoseconds heartbeat_interval = std::chrono::milliseconds(500);
+};
+
 struct CleanupGuard
 {
     std::string dir;
@@ -93,11 +112,13 @@ struct EchoSrvHandler
     bool on_message(auto& ch, MsgView msg) {
         if (force_backpressure.load(std::memory_order_acquire)) {
             backpressure_hits.fetch_add(1, std::memory_order_relaxed);
-            return false; // defer consumption
+            return false;
         }
         rx_count.fetch_add(1, std::memory_order_relaxed);
         auto tx = ch.try_alloc(msg.type(), msg.payload_size());
         if (!tx) return false;
+        tx->set_flags(msg.flags());
+        tx->set_reserved(msg.reserved());
         CHECK(tx->write_bytes(msg.payload()));
         tx->commit();
         return true;
@@ -133,6 +154,26 @@ struct RecordingClientHandler
 
     void on_disconnected(Error) { disconnected = true; }
     void on_seq_mismatch(const SeqMismatchInfo&) { seq_mismatch = true; }
+};
+
+struct LargeClientHandler
+{
+    struct Packet
+    {
+        uint16_t flags = 0;
+        uint32_t reserved = 0;
+        std::vector<std::byte> bytes;
+    };
+    std::vector<Packet> packets;
+
+    void on_server_msg(MsgView msg) {
+        Packet pkt;
+        pkt.flags = msg.flags();
+        pkt.reserved = msg.reserved();
+        auto span = msg.payload();
+        pkt.bytes.assign(span.begin(), span.end());
+        packets.push_back(std::move(pkt));
+    }
 };
 
 template<template<uint32_t> class TcpPoller>
@@ -184,7 +225,6 @@ void run_end_to_end_suite(std::string_view tag) {
         }
         CHECK(srv_h.backpressure_hits.load() > 0 && ch.replies.empty());
 
-        // Release backpressure -> all 10 messages arrive in order
         srv_h.force_backpressure.store(false, std::memory_order_release);
         const TimePoint deadline = steady_now() + std::chrono::seconds(2);
         while (ch.replies.size() < 10 && steady_now() < deadline) {
@@ -197,7 +237,7 @@ void run_end_to_end_suite(std::string_view tag) {
         cli.stop();
     }
 
-    // 2. Two concurrent TcpClients (exercises both BusyPoller & EpollPoller) + PTCP reconnect & SeqMismatch
+    // 2. Two concurrent TcpClients + PTCP reconnect & SeqMismatch
     {
         RecordingClientHandler ch1;
         RecordingClientHandler ch2;
@@ -219,7 +259,6 @@ void run_end_to_end_suite(std::string_view tag) {
         CHECK(cli1->channel().flush());
         CHECK(cli2->channel().flush());
 
-        // Test client-side receive backpressure on cli1 first
         ch1.backpressure = true;
         for (int k = 0; k < 5; ++k) {
             cli1->poll_tcp(steady_now());
@@ -242,7 +281,6 @@ void run_end_to_end_suite(std::string_view tag) {
             CHECK(ch2.replies[i] == i + 2000);
         }
 
-        // Disconnect cli1 cleanly and verify PTCP reconnect picks up without error
         cli1->stop();
         const TimePoint d_wait = steady_now() + std::chrono::seconds(2);
         while (srv_h.disc_count.load() < 2 && steady_now() < d_wait) {
@@ -265,7 +303,6 @@ void run_end_to_end_suite(std::string_view tag) {
         }
         CHECK(ch1.replies.size() == 1 && ch1.replies[0] == 99999);
 
-        // Corrupt / stale client PTCP directory forces SeqMismatch callback
         cli1->stop();
         const TimePoint d_wait2 = steady_now() + std::chrono::seconds(2);
         while (srv_h.disc_count.load() < 3 && steady_now() < d_wait2) {
@@ -276,7 +313,6 @@ void run_end_to_end_suite(std::string_view tag) {
         std::filesystem::remove_all(cg.dir + "/c1");
         std::filesystem::create_directories(cg.dir + "/c1");
         {
-            // Keep .lastserver matching srv_e2e while client PTCP queue starts at 0 -> mismatch against server's ack=41
             std::array<char, IntTestConfig::name_size>* ls = nullptr;
             std::string ls_path = cg.dir + "/c1/tcp_c1.lastserver";
             auto ls_res = detail::mmap_create_or_open<std::array<char, IntTestConfig::name_size>>(ls_path.c_str(), false);
@@ -299,12 +335,108 @@ void run_end_to_end_suite(std::string_view tag) {
     srv->stop();
 }
 
+template<template<uint32_t> class TcpPoller>
+void run_large_over_64k_suite(std::string_view tag) {
+    CleanupGuard cg;
+    cg.dir = (std::filesystem::temp_directory_path() /
+              ("tcpshm_v2_big_" + std::string(tag) + "_" + std::to_string(::getpid())))
+                 .string();
+    std::filesystem::remove_all(cg.dir);
+    std::filesystem::create_directories(cg.dir);
+    cg.track_pair("srv_big", "shm_big");
+
+    const uint16_t port = pick_unused_port();
+    EchoSrvHandler srv_h;
+    auto srv = std::make_unique<Server<EchoSrvHandler, LargeTestConfig, TcpPoller>>(srv_h, "srv_big", cg.dir + "/srv");
+    CHECK(srv->start("127.0.0.1", port).has_value());
+
+    std::atomic<bool> stop_flag{false};
+    std::thread io_thread([&]() {
+        while (!stop_flag.load(std::memory_order_acquire)) {
+            const TimePoint now = steady_now();
+            srv->poll_ctl(now);
+            srv->poll_shm(0);
+            srv->poll_tcp(now, 0);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+
+    constexpr uint32_t kLargePayload = 128u * 1024u + 13u; // > 64 KiB & non-multiple-of-16
+    std::vector<std::byte> pattern(kLargePayload);
+    for (uint32_t i = 0; i < kLargePayload; ++i) {
+        pattern[i] = static_cast<std::byte>((i * 31u + 7u) & 0xFFu);
+    }
+
+    // SHM >64 KiB round-trip with flags & reserved preservation
+    {
+        LargeClientHandler ch;
+        ShmClient<LargeClientHandler, LargeTestConfig> cli(ch, "shm_big", cg.dir + "/c_shm");
+        CHECK(cli.connect("127.0.0.1", port).has_value());
+        {
+            auto tx = cli.channel().try_alloc(9, kLargePayload);
+            CHECK(tx.has_value());
+            tx->set_flags(0xA55Au);
+            tx->set_reserved(0x13579BDFu);
+            CHECK(tx->write_bytes(pattern));
+            tx->commit();
+        }
+        const TimePoint deadline = steady_now() + std::chrono::seconds(2);
+        while (ch.packets.empty() && steady_now() < deadline) {
+            cli.poll_shm();
+            cli.poll_keepalive(steady_now());
+            std::this_thread::yield();
+        }
+        CHECK(ch.packets.size() == 1);
+        CHECK(ch.packets[0].flags == 0xA55Au);
+        CHECK(ch.packets[0].reserved == 0x13579BDFu);
+        CHECK(ch.packets[0].bytes == pattern);
+        cli.stop();
+    }
+
+    // TCP >64 KiB round-trip x3: verifies immediate ACK piggyback reclaims 256 KiB tcp_queue without waiting for 500ms HB
+    {
+        LargeClientHandler ch;
+        TcpClient<LargeClientHandler, LargeTestConfig> cli(ch, "tcp_big", cg.dir + "/c_tcp");
+        CHECK(cli.connect("127.0.0.1", port).has_value());
+        for (uint32_t round = 0; round < 3; ++round) {
+            const TimePoint round_deadline = steady_now() + std::chrono::milliseconds(300);
+            while (true) {
+                if (auto tx = cli.channel().try_alloc(11, kLargePayload)) {
+                    tx->set_flags(static_cast<uint16_t>(0x5AA5u + round));
+                    tx->set_reserved(0x2468ACE0u + round);
+                    CHECK(tx->write_bytes(pattern));
+                    tx->commit();
+                    break;
+                }
+                CHECK(steady_now() < round_deadline);
+                cli.poll_tcp(steady_now());
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            while (ch.packets.size() <= round && steady_now() < round_deadline) {
+                cli.poll_tcp(steady_now());
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            CHECK(ch.packets.size() == round + 1u);
+            CHECK(ch.packets[round].flags == static_cast<uint16_t>(0x5AA5u + round));
+            CHECK(ch.packets[round].reserved == 0x2468ACE0u + round);
+            CHECK(ch.packets[round].bytes == pattern);
+        }
+        cli.stop();
+    }
+
+    stop_flag.store(true, std::memory_order_release);
+    io_thread.join();
+    srv->stop();
+}
+
 } // namespace
 
 int main() {
     run_end_to_end_suite<BusyPoller>("busy");
+    run_large_over_64k_suite<BusyPoller>("busy");
 #ifdef __linux__
     run_end_to_end_suite<EpollPoller>("epoll");
+    run_large_over_64k_suite<EpollPoller>("epoll");
 #endif
     std::cout << "integration_server_client_test passed\n";
     return 0;

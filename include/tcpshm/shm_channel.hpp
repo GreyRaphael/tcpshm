@@ -63,9 +63,11 @@ public:
 
     ShmChannel() noexcept {
         remote_name_[0] = '\0';
-        hb_frame_.size = static_cast<uint16_t>(sizeof(FrameHeader));
+        hb_frame_.size = kFrameHeaderSize;
         hb_frame_.msg_type = kHeartbeatMsgType;
+        hb_frame_.flags = 0;
         hb_frame_.ack_seq = 0;
+        hb_frame_.reserved = 0;
         hb_frame_.template convert_byte_order<Config::wire_endian>();
     }
 
@@ -76,11 +78,11 @@ public:
     ShmChannel(ShmChannel&&) = delete;
     ShmChannel& operator=(ShmChannel&&) = delete;
 
-    [[nodiscard]] auto try_alloc(uint16_t msg_type, uint16_t payload_size) noexcept {
+    [[nodiscard]] auto try_alloc(uint16_t msg_type, uint32_t payload_size) noexcept {
         return sendq_.try_alloc(msg_type, payload_size);
     }
 
-    [[nodiscard]] auto try_alloc(uint16_t payload_size) noexcept {
+    [[nodiscard]] auto try_alloc(uint32_t payload_size) noexcept {
         return sendq_.try_alloc(kFirstAppMsgType, payload_size);
     }
 
@@ -134,7 +136,7 @@ private:
 
         if (!sendq_.is_attached()) {
             auto res = detail::mmap_create_or_open<Layout>(send_name.c_str(), true, false);
-            if (!res) [[unlikely]] return std::unexpected(res.error());
+            if (!res) [[unlikely]] return make_error(res.error());
             sendq_.attach(*res);
         }
         if (!recvq_.is_attached()) {
@@ -143,7 +145,7 @@ private:
                 if (Layout* old_send = sendq_.detach()) {
                     detail::munmap_region(old_send);
                 }
-                return std::unexpected(res.error());
+                return make_error(res.error());
             }
             recvq_.attach(*res);
         }

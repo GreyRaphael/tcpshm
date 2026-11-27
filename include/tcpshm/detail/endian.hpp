@@ -33,17 +33,39 @@ namespace tcpshm::detail {
 static_assert(std::endian::native == std::endian::little || std::endian::native == std::endian::big,
               "Mixed-endian platforms are not supported");
 
+[[nodiscard]] constexpr uint16_t bswap16(uint16_t v) noexcept {
+    return static_cast<uint16_t>((v >> 8u) | (v << 8u));
+}
+
+[[nodiscard]] constexpr uint32_t bswap32(uint32_t v) noexcept {
+    return ((v & 0x000000FFu) << 24u) |
+           ((v & 0x0000FF00u) << 8u) |
+           ((v & 0x00FF0000u) >> 8u) |
+           ((v & 0xFF000000u) >> 24u);
+}
+
+[[nodiscard]] constexpr uint64_t bswap64(uint64_t v) noexcept {
+    return ((v & 0x00000000000000FFULL) << 56u) |
+           ((v & 0x000000000000FF00ULL) << 40u) |
+           ((v & 0x0000000000FF0000ULL) << 24u) |
+           ((v & 0x00000000FF000000ULL) << 8u) |
+           ((v & 0x000000FF00000000ULL) >> 8u) |
+           ((v & 0x0000FF0000000000ULL) >> 24u) |
+           ((v & 0x00FF000000000000ULL) >> 40u) |
+           ((v & 0xFF00000000000000ULL) >> 56u);
+}
+
 template<std::endian WireEndian, typename T>
     requires std::is_trivially_copyable_v<T>
 [[nodiscard]] constexpr T convert_endian(T value) noexcept {
     if constexpr (WireEndian == std::endian::native || sizeof(T) == 1) {
         return value;
     } else if constexpr (sizeof(T) == 2) {
-        return std::bit_cast<T>(std::byteswap(std::bit_cast<uint16_t>(value)));
+        return std::bit_cast<T>(bswap16(std::bit_cast<uint16_t>(value)));
     } else if constexpr (sizeof(T) == 4) {
-        return std::bit_cast<T>(std::byteswap(std::bit_cast<uint32_t>(value)));
+        return std::bit_cast<T>(bswap32(std::bit_cast<uint32_t>(value)));
     } else if constexpr (sizeof(T) == 8) {
-        return std::bit_cast<T>(std::byteswap(std::bit_cast<uint64_t>(value)));
+        return std::bit_cast<T>(bswap64(std::bit_cast<uint64_t>(value)));
     } else {
         static_assert(sizeof(T) == 0, "Unsupported type size for endian conversion");
     }

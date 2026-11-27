@@ -1,21 +1,23 @@
 [English](interface.md) | [中文](interface-CN.md)
 
-# tcpshm v2 Interface Documentation (C++23)
+# tcpshm v2 Interface Documentation (C++20)
 
-`tcpshm` v2 is a header-only C++23 IPC & persistent TCP messaging library for Linux and Windows.
+`tcpshm` v2 is a header-only C++20 IPC & persistent TCP messaging library for Linux and Windows.
 
 ---
 
 ## 1. Frame Protocol & Zero-Overhead RAII API (`frame.hpp`)
 
-### 8-Byte `FrameHeader`
-Every message uses a compact 8-byte `alignas(8)` header, capping total frame length at `65535` bytes (maximum payload `kMaxPayloadSize = 65527` bytes):
+### 16-Byte `alignas(16)` `FrameHeader`
+Every message uses a 16-byte `alignas(16)` header, supporting large payloads up to `kMaxPayloadSize = kMaxFrameSize - 16` (`64 MiB - 16`), 16-byte SIMD payload alignment, and dedicated protocol/user extension fields:
 
 ```cpp
-struct alignas(8) FrameHeader {
-    uint16_t size;     // Total frame size in bytes including 8B header
-    uint16_t msg_type; // Application message ID (0 is reserved for internal heartbeat)
+struct alignas(16) FrameHeader {
+    uint32_t size;     // Total frame size in bytes including 16B header (0 = SPSC rewind sentinel)
+    uint16_t msg_type; // Application message ID (0 reserved for internal heartbeat)
+    uint16_t flags;    // Extensible protocol/application flags (preserved end-to-end)
     uint32_t ack_seq;  // PTCP peer ACK sequence or local SPSC metadata
+    uint32_t reserved; // Reserved user/protocol metadata (preserved end-to-end)
 };
 ```
 
@@ -24,11 +26,13 @@ struct alignas(8) FrameHeader {
 > * `1..4` during TCP handshake: Used internally for `LoginMsg` / `LoginRspMsg` / `ShmProbeReqMsg` / `ShmProbeRspMsg`. Once connected, applications may freely use `msg_type >= 1`.
 
 ### Sending with `WriteGuard`
-Instead of raw pointer arithmetic, `try_alloc()` returns `std::optional<WriteGuard<...>>`:
+Instead of raw pointer arithmetic, `try_alloc(msg_type, payload_bytes)` returns `std::optional<WriteGuard<...>>`:
 
 ```cpp
 // Immediate commit + send/publish:
 if (auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, payload_len)) {
+    tx->set_flags(my_flags);
+    tx->set_reserved(my_tag);
     tx->write_str(data);       // or write_pod(pod), emplace<T>(...), write_bytes(span)
     tx->commit();
 }
@@ -36,11 +40,11 @@ if (auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, payload_len)) {
 // Pipelined batch send:
 for (int i = 0; i < 16; ++i) {
     if (auto tx = ch.try_alloc(1, sizeof(Order))) {
-        tx->emplace<Order>(/* ... */);
-        tx->stage();           // Stays local until flush()
+        tx->emplace<Order>(/* ... */); // supports alignof(Order) up to 16 bytes
+        tx->stage();                   // stays local until flush()
     }
 }
-ch.flush();                    // Single atomic release store (SHM) or batched tcp_send (TCP)
+ch.flush();                            // single atomic release store (SHM) or batched tcp_send (TCP)
 ```
 
 If a `WriteGuard` leaves scope without `.commit()` or `.stage()`, its destructor automatically calls `.cancel()`, preventing partial-write stalls.
@@ -48,9 +52,9 @@ If a `WriteGuard` leaves scope without `.commit()` or `.stage()`, its destructor
 ### Receiving with `MsgView`
 Server (`on_message(ch, MsgView)`) and client (`on_server_msg(MsgView)`) callbacks receive an immutable `MsgView`:
 
-* `msg.type()`, `msg.payload_size()`, `msg.payload()` (`std::span<const std::byte>`), `msg.payload_str()` (`std::string_view`), `msg.read_as<T>()` (`std::optional<T>`).
-* Returning `void` (or `true`) automatically consumes the frame (`drain` commits the entire batch's `read_idx` with a single `release` store at batch end).
-* Returning `bool` (`false`) triggers **backpressure**: consumption stops without advancing past that frame, so the next poll re-delivers it.
+* `msg.type()`, `msg.flags()`, `msg.reserved()`, `msg.payload_size()`, `msg.payload()` (`std::span<const std::byte>`), `msg.payload_str()` (`std::string_view`), `msg.read_as<T>()`, `msg.as_ptr<T>()` (supports up to `alignof(T) <= 16`).
+* Returning `void` (or `true`) consumes the frame; for TCP, the peer `ack_seq` is pre-incremented before calling the callback so immediate replies inside `on_message` piggyback the fresh ACK right away.
+* Returning `bool` (`false`) triggers **backpressure**: consumption stops and any pre-incremented ACK rolls back cleanly, so the next poll re-delivers the frame.
 
 ---
 
@@ -61,11 +65,11 @@ Custom configs can inherit from `tcpshm::DefaultConfig` and are statically check
 ```cpp
 struct MyConfig : tcpshm::DefaultConfig {
     static constexpr uint32_t name_size = 16;
-    static constexpr uint32_t shm_queue_bytes = 1u << 20;      // blk_cnt = shm_queue_bytes / shm_block_bytes must be power of 2
-    static constexpr uint32_t shm_block_bytes = 64;            // power of 2 multiple of 8
-    static constexpr uint32_t tcp_queue_bytes = 256u << 10;    // multiple of 8
-    static constexpr uint32_t tcp_recv_init_bytes = 4096;
-    static constexpr uint32_t tcp_recv_max_bytes = 64u << 10;
+    static constexpr uint32_t shm_queue_bytes = 1u << 20;      // shm_queue_bytes / shm_block_bytes must be power of 2
+    static constexpr uint32_t shm_block_bytes = 64;            // power of 2 multiple of 16
+    static constexpr uint32_t tcp_queue_bytes = 1u << 20;      // multiple of 16
+    static constexpr uint32_t tcp_recv_init_bytes = 4096;      // multiple of 16
+    static constexpr uint32_t tcp_recv_max_bytes = 1u << 20;   // multiple of 16, <= kMaxFrameSize
     static constexpr uint32_t max_shm_groups = 1;
     static constexpr uint32_t max_shm_conns_per_group = 4;
     static constexpr uint32_t max_tcp_groups = 1;
@@ -83,13 +87,13 @@ struct MyConfig : tcpshm::DefaultConfig {
 };
 ```
 
-Wait-free handshakes exchange `config_fingerprint<Config>()` (hashing endianness, header size, name size, SHM layout geometry, and login user-data sizes) to reject incompatible clients before opening shared memory.
+Wait-free handshakes exchange `config_fingerprint<Config>()` (hashing endianness, 16-byte `FrameHeader` size, name size, SHM layout geometry, and login user-data sizes) to reject incompatible clients before opening shared memory.
 
 ---
 
 ## 3. Error Handling (`error.hpp`)
 
-All setup, connect, and I/O errors use zero-allocation `tcpshm::Result<T>` (`std::expected<T, tcpshm::Error>`) and `tcpshm::VoidResult`. Inspect `err.code` (`ErrorCode`), `err.sys_errno`, and `err.message()`. No exceptions are thrown.
+All setup, connect, and I/O errors use zero-allocation `tcpshm::Result<T>` (`tcpshm::Expected<T, tcpshm::Error>`) and `tcpshm::VoidResult`. Inspect `err.code` (`ErrorCode`), `err.sys_errno`, and `err.message()`. No exceptions are thrown.
 
 ---
 

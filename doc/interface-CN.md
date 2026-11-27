@@ -1,21 +1,23 @@
 [English](interface.md) | [中文](interface-CN.md)
 
-# tcpshm v2 接口与开发指南 (C++23)
+# tcpshm v2 接口与开发指南 (C++20)
 
-`tcpshm` v2 是基于 **C++23** 实现的纯头文件 IPC 与持久化 TCP 消息队列框架，支持 **Linux 与 Windows**。
+`tcpshm` v2 是基于纯 **C++20** 标准库实现的头文件 IPC 与持久化 TCP 消息队列框架，支持 **Linux 与 Windows**。
 
 ---
 
 ## 1. 帧协议与零开销 RAII API (`frame.hpp`)
 
-### 8 字节极简 `FrameHeader`
-每条消息均携带紧凑的 8 字节 `alignas(8)` 帧头，总长度上限 `65535` 字节（单包有效载荷上限 `kMaxPayloadSize = 65527` 字节）：
+### 16 字节 `alignas(16)` 帧头 (`FrameHeader`)
+每条消息均携带 16 字节 `alignas(16)` 帧头，支持突破 64 KiB 的大消息载荷（上限 `kMaxPayloadSize = kMaxFrameSize - 16`，默认 `64 MiB - 16`）、载荷天然 16B SIMD 对齐，以及 `flags`/`reserved` 扩展槽位：
 
 ```cpp
-struct alignas(8) FrameHeader {
-    uint16_t size;     // 消息总字节大小（含 8B 帧头）
+struct alignas(16) FrameHeader {
+    uint32_t size;     // 消息总字节大小（含 16B 帧头；0 为 SPSC 回绕哨兵）
     uint16_t msg_type; // 应用消息类型 ID（0 为底层心跳保留）
+    uint16_t flags;    // 可扩展协议/业务标志位（端到端透传）
     uint32_t ack_seq;  // PTCP ACK 序列号，或本地 SPSC 队列元数据
+    uint32_t reserved; // 预留扩展槽位/自定义元数据（端到端透传）
 };
 ```
 
@@ -24,11 +26,13 @@ struct alignas(8) FrameHeader {
 > * `1..4` 在 TCP 登录握手期间内部使用；连接建立完成（触发 `on_login_success` / `on_client_logon`）后，业务层可自由复用 `msg_type >= 1`。
 
 ### 使用 `WriteGuard` 安全发送
-通过 `ch.try_alloc(msg_type, payload_len)` 获取 `std::optional<WriteGuard<...>>`：
+通过 `ch.try_alloc(msg_type, payload_bytes)` 获取 `std::optional<WriteGuard<...>>`：
 
 ```cpp
 // 单条立即发送：
 if (auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, payload_len)) {
+    tx->set_flags(my_flags);
+    tx->set_reserved(my_tag);
     tx->write_str(data);       // 也支持 write_pod(pod)、emplace<T>(...)、write_bytes(span)
     tx->commit();              // 立即提交并刷出
 }
@@ -36,11 +40,11 @@ if (auto tx = ch.try_alloc(tcpshm::kFirstAppMsgType, payload_len)) {
 // 批量流水线发送：
 for (int i = 0; i < 16; ++i) {
     if (auto tx = ch.try_alloc(1, sizeof(Order))) {
-        tx->emplace<Order>(/* ... */);
-        tx->stage();           // 仅暂存本地批，暂不触发原子 store 或 TCP send()
+        tx->emplace<Order>(/* ... */); // 支持高达 16B 对齐的结构体零拷贝构造
+        tx->stage();                   // 仅暂存本地批，暂不触发原子 store 或 TCP send()
     }
 }
-ch.flush();                    // 批末一次性原子发布 (SHM) 或单次 syscall 合并发送 (TCP)
+ch.flush();                            // 批末一次性原子发布 (SHM) 或单次 syscall 合并发送 (TCP)
 ```
 
 若 `WriteGuard` 未调用 `commit()` 或 `stage()` 即离开作用域，析构会自动调用 `cancel()`，杜绝半写帧污染。
@@ -48,24 +52,24 @@ ch.flush();                    // 批末一次性原子发布 (SHM) 或单次 sy
 ### 使用 `MsgView` 安全接收
 服务端回调 `on_message(ch, MsgView)` 与客户端回调 `on_server_msg(MsgView)` 直接获得不可变视图 `MsgView`：
 
-* 常用方法：`msg.type()`、`msg.payload_size()`、`msg.payload()` (`std::span<const std::byte>`)、`msg.payload_str()` (`std::string_view`)、`msg.read_as<T>()` (`std::optional<T>`)。
-* 返回 `void`（或返回 `true`）代表消费完成；底层批量 `drain()` 会在整批结束时用单次 `release` 更新 `read_idx`。
-* 若回调返回类型为 `bool` 且返回 `false`，代表**背压拒绝消费**：停止推进该帧，留待下一次轮询重投递。
+* 常用方法：`msg.type()`、`msg.flags()`、`msg.reserved()`、`msg.payload_size()`、`msg.payload()` (`std::span<const std::byte>`)、`msg.payload_str()` (`std::string_view`)、`msg.read_as<T>()`、`msg.as_ptr<T>()`（支持最高 16 字节对齐零拷贝读取）。
+* 返回 `void`（或返回 `true`）代表消费完成；在 TCP 通道中，回调前会先递进 `my_ack()`，确保在 `on_message` 内立即回复时可以直接捎带当前请求的 ACK。
+* 若回调返回类型为 `bool` 且返回 `false`，代表**背压拒绝消费**：回滚未消费 ACK 并停止推进读取游标，留待下一次轮询重投递。
 
 ---
 
 ## 2. 编译期配置与 `ConfigConcept` (`config.hpp`)
 
-用户配置只需继承 `tcpshm::DefaultConfig` 并覆盖所需静态常量，框架通过 `ConfigConcept` 在编译期拦截非法配置（如非 2 的幂或未按 8 字节对齐）：
+用户配置只需继承 `tcpshm::DefaultConfig` 并覆盖所需静态常量，框架通过 `ConfigConcept` 在编译期拦截非法配置（如非 2 的幂或未按 16 字节对齐）：
 
 ```cpp
 struct MyConfig : tcpshm::DefaultConfig {
     static constexpr uint32_t name_size = 16;
     static constexpr uint32_t shm_queue_bytes = 1u << 20;      // shm_queue_bytes / shm_block_bytes 须为 2 的幂
-    static constexpr uint32_t shm_block_bytes = 64;            // 须为 8 的 2 次幂倍数
-    static constexpr uint32_t tcp_queue_bytes = 256u << 10;    // 须为 8 的倍数
-    static constexpr uint32_t tcp_recv_init_bytes = 4096;
-    static constexpr uint32_t tcp_recv_max_bytes = 64u << 10;
+    static constexpr uint32_t shm_block_bytes = 64;            // 须为 16 的 2 次幂倍数
+    static constexpr uint32_t tcp_queue_bytes = 1u << 20;      // 须为 16 的倍数
+    static constexpr uint32_t tcp_recv_init_bytes = 4096;      // 须为 16 的倍数
+    static constexpr uint32_t tcp_recv_max_bytes = 1u << 20;   // 须为 16 的倍数且 <= kMaxFrameSize
     static constexpr uint32_t max_shm_groups = 1;
     static constexpr uint32_t max_shm_conns_per_group = 4;
     static constexpr uint32_t max_tcp_groups = 1;
@@ -83,13 +87,13 @@ struct MyConfig : tcpshm::DefaultConfig {
 };
 ```
 
-握手阶段会自动校对 `config_fingerprint<Config>()`（涵盖字节序、帧头大小、`name_size`、SHM 布局参数及登录附加数据结构大小），防止服务端与客户端配置错配导致静默数据损坏。
+握手阶段会自动校对 `config_fingerprint<Config>()`（涵盖字节序、16B 帧头尺寸、`name_size`、SHM 布局参数及登录附加数据结构大小），防止服务端与客户端配置错配导致静默数据损坏。
 
 ---
 
 ## 3. 错误处理 (`error.hpp`)
 
-核心路径全程无 C++ 异常、零堆分配，全部结果通过 `tcpshm::Result<T>`（`std::expected<T, tcpshm::Error>`）与 `tcpshm::VoidResult` 返回，可通过 `err.code`、`err.sys_errno` 与 `err.message()` 精准诊断错误原因。
+核心路径全程无 C++ 异常、零堆分配，全部结果通过 `tcpshm::Result<T>`（纯 C++20 `tcpshm::Expected<T, tcpshm::Error>`）与 `tcpshm::VoidResult` 返回，可通过 `err.code`、`err.sys_errno` 与 `err.message()` 精准诊断错误原因。
 
 ---
 

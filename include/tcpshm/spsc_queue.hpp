@@ -44,9 +44,9 @@ template<uint32_t Bytes, uint32_t BlkSz = 64>
 struct SpscRingLayout
 {
     static constexpr uint32_t kBlkSz = BlkSz;
-    static constexpr uint32_t kHdrSz = static_cast<uint32_t>(sizeof(FrameHeader));
+    static constexpr uint32_t kHdrSz = kFrameHeaderSize;
     static_assert(kBlkSz >= kHdrSz && (kBlkSz % kHdrSz == 0) && std::has_single_bit(kBlkSz),
-                  "BlkSz must be a power-of-2 multiple of 8");
+                  "BlkSz must be a power-of-2 multiple of 16");
     static_assert(Bytes >= kBlkSz && Bytes % kBlkSz == 0, "Bytes must be a positive multiple of BlkSz");
     static constexpr uint32_t kBlkCnt = Bytes / kBlkSz;
     static_assert(kBlkCnt > 0 && std::has_single_bit(kBlkCnt), "kBlkCnt must be a power of 2");
@@ -121,13 +121,13 @@ public:
         staged_ = false;
     }
 
-    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t msg_type, uint16_t payload_size) noexcept {
+    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t msg_type, uint32_t payload_size) noexcept {
         pending_blk_sz_ = 0;
         if (!layout_ || payload_size > kMaxPayloadSize) [[unlikely]] {
             return std::nullopt;
         }
-        const uint32_t total_size = static_cast<uint32_t>(payload_size) + kHdrSz;
-        const uint32_t blk_sz = (total_size + kBlkSz - 1u) / kBlkSz;
+        const uint32_t total_size = payload_size + kHdrSz;
+        const uint32_t blk_sz = (total_size - 1u) / kBlkSz + 1u;
         if (blk_sz > kBlkCnt) [[unlikely]] {
             return std::nullopt;
         }
@@ -143,22 +143,22 @@ public:
             }
         }
         if (rewind) [[unlikely]] {
-            new (layout_->buf + static_cast<size_t>(local_write & (kBlkCnt - 1u)) * kBlkSz) FrameHeader{0, 0, 0};
+            new (layout_->buf + static_cast<size_t>(local_write & (kBlkCnt - 1u)) * kBlkSz)
+                FrameHeader{0, 0, 0, 0, 0};
             local_write += padding_sz;
         }
         FrameHeader* hdr =
             new (layout_->buf + static_cast<size_t>(local_write & (kBlkCnt - 1u)) * kBlkSz)
-                FrameHeader{static_cast<uint16_t>(total_size), msg_type, 0};
+                FrameHeader{total_size, msg_type, 0, 0, 0};
         pending_write_idx_ = local_write + blk_sz;
         pending_blk_sz_ = blk_sz;
         return std::optional<Guard>(std::in_place, this, hdr, payload_size);
     }
 
-    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t payload_size) noexcept {
+    [[nodiscard]] std::optional<Guard> try_alloc(uint32_t payload_size) noexcept {
         return try_alloc(kFirstAppMsgType, payload_size);
     }
 
-    // Publish all staged messages in a single release store.
     void flush() noexcept {
         if (!layout_ || !staged_) [[unlikely]] return;
         std::atomic_ref<uint32_t>(layout_->write_idx).store(local_write_idx_, std::memory_order_release);
@@ -248,7 +248,6 @@ public:
         front_blk_sz_ = 0;
     }
 
-    // Pull a single message with RAII auto-pop guard.
     [[nodiscard]] std::optional<Guard> try_front() noexcept {
         const FrameHeader* hdr = front_raw();
         if (!hdr) return std::nullopt;
@@ -263,7 +262,6 @@ public:
     }
 
     // Batch-consume up to max_batch frames with a single release store of read_idx at batch end.
-    // Callback fn(MsgView) may return void (always consume) or bool (false = backpressure, stop and keep frame).
     template<typename Fn>
         requires std::invocable<Fn&, MsgView>
     uint32_t drain(Fn&& fn, uint32_t max_batch = 64) {
@@ -287,10 +285,10 @@ public:
                 local_read += kBlkCnt - slot;
                 continue;
             }
-            if (hdr.size < kHdrSz) [[unlikely]] {
+            if (hdr.size < kHdrSz || hdr.size > kMaxFrameSize) [[unlikely]] {
                 break;
             }
-            const uint32_t blk_sz = (static_cast<uint32_t>(hdr.size) + kBlkSz - 1u) / kBlkSz;
+            const uint32_t blk_sz = (hdr.size - 1u) / kBlkSz + 1u;
             const uint32_t avail_blks = write_cache - local_read;
             if (blk_sz > avail_blks || blk_sz > kBlkCnt - slot) [[unlikely]] {
                 break;
@@ -344,10 +342,10 @@ private:
             slot = local_read & (kBlkCnt - 1u);
             std::memcpy(&hdr, layout_->buf + static_cast<size_t>(slot) * kBlkSz, sizeof(FrameHeader));
         }
-        if (hdr.size < kHdrSz) [[unlikely]] {
+        if (hdr.size < kHdrSz || hdr.size > kMaxFrameSize) [[unlikely]] {
             return nullptr;
         }
-        const uint32_t blk_sz = (static_cast<uint32_t>(hdr.size) + kBlkSz - 1u) / kBlkSz;
+        const uint32_t blk_sz = (hdr.size - 1u) / kBlkSz + 1u;
         const uint32_t avail_blks = write_idx_cache_ - local_read;
         if (blk_sz > avail_blks || blk_sz > kBlkCnt - slot) [[unlikely]] {
             return nullptr;
@@ -391,11 +389,11 @@ public:
         cons_.attach(&layout_);
     }
 
-    [[nodiscard]] auto try_alloc(uint16_t msg_type, uint16_t payload_size) noexcept {
+    [[nodiscard]] auto try_alloc(uint16_t msg_type, uint32_t payload_size) noexcept {
         return prod_.try_alloc(msg_type, payload_size);
     }
 
-    [[nodiscard]] auto try_alloc(uint16_t payload_size) noexcept {
+    [[nodiscard]] auto try_alloc(uint32_t payload_size) noexcept {
         return prod_.try_alloc(payload_size);
     }
 

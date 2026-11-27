@@ -24,6 +24,7 @@ SOFTWARE.
 
 #pragma once
 
+#include "tcpshm/frame.hpp"
 #include <bit>
 #include <chrono>
 #include <concepts>
@@ -48,11 +49,11 @@ static_assert(std::is_trivially_copyable_v<EmptyUserData>);
 struct DefaultConfig
 {
     static constexpr uint32_t name_size = 32;
-    static constexpr uint32_t shm_queue_bytes = 1u << 20;      // 1 MiB, blk_cnt must be power of 2
-    static constexpr uint32_t shm_block_bytes = 64;            // power of 2 multiple of 8
-    static constexpr uint32_t tcp_queue_bytes = 1u << 20;      // 1 MiB, multiple of 8
-    static constexpr uint32_t tcp_recv_init_bytes = 4096;      // multiple of 8
-    static constexpr uint32_t tcp_recv_max_bytes = 64u << 10;  // 64 KiB, multiple of 8
+    static constexpr uint32_t shm_queue_bytes = 1u << 20;     // 1 MiB, blk_cnt must be power of 2
+    static constexpr uint32_t shm_block_bytes = 64;           // power-of-2 multiple of 16
+    static constexpr uint32_t tcp_queue_bytes = 1u << 20;     // 1 MiB, multiple of 16
+    static constexpr uint32_t tcp_recv_init_bytes = 4096;     // multiple of 16
+    static constexpr uint32_t tcp_recv_max_bytes = 1u << 20;  // 1 MiB, multiple of 16
 
     static constexpr uint32_t max_shm_groups = 1;
     static constexpr uint32_t max_shm_conns_per_group = 4;
@@ -98,15 +99,17 @@ concept ConfigConcept =
         typename C::ConnectionUserData;
     } &&
     (C::name_size >= 8u) &&
-    (C::shm_block_bytes >= 8u) &&
-    (C::shm_block_bytes % 8u == 0u) &&
+    (C::shm_block_bytes >= kFrameAlign) &&
+    (C::shm_block_bytes % kFrameAlign == 0u) &&
     std::has_single_bit(C::shm_block_bytes) &&
     (C::shm_queue_bytes >= C::shm_block_bytes) &&
     (C::shm_queue_bytes % C::shm_block_bytes == 0u) &&
     std::has_single_bit(C::shm_queue_bytes / C::shm_block_bytes) &&
-    (C::tcp_queue_bytes >= 8u && C::tcp_queue_bytes % 8u == 0u) &&
-    (C::tcp_recv_init_bytes >= 8u && C::tcp_recv_init_bytes % 8u == 0u) &&
-    (C::tcp_recv_max_bytes >= C::tcp_recv_init_bytes && C::tcp_recv_max_bytes % 8u == 0u) &&
+    (C::tcp_queue_bytes >= kFrameAlign && C::tcp_queue_bytes % kFrameAlign == 0u) &&
+    (C::tcp_recv_init_bytes >= kFrameAlign && C::tcp_recv_init_bytes % kFrameAlign == 0u) &&
+    (C::tcp_recv_max_bytes >= C::tcp_recv_init_bytes &&
+     C::tcp_recv_max_bytes % kFrameAlign == 0u &&
+     C::tcp_recv_max_bytes <= kMaxFrameSize) &&
     (C::max_shm_groups >= 1u && C::max_shm_conns_per_group >= 1u) &&
     (C::max_tcp_groups >= 1u && C::max_tcp_conns_per_group >= 1u) &&
     (C::max_pending_conns >= 1u && C::poll_batch_size >= 1u) &&
@@ -134,7 +137,7 @@ template<ConfigConcept Config>
     };
     uint64_t h = kFnvOffset;
     h = mix_u64(h, Config::wire_endian == std::endian::little ? 1ULL : 2ULL);
-    h = mix_u64(h, 8ULL); // 8-byte FrameHeader
+    h = mix_u64(h, kFrameHeaderSize); // 16-byte FrameHeader
     h = mix_u64(h, Config::name_size);
     h = mix_u64(h, Config::shm_queue_bytes);
     h = mix_u64(h, Config::shm_block_bytes);

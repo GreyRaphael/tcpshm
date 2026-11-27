@@ -143,14 +143,16 @@ inline bool handle_shm_probe_request(socket_t fd, const FrameHeader& hdr, Error&
         }
     }
 
-    struct alignas(8) ProbeRspPacket
+    struct alignas(16) ProbeRspPacket
     {
         FrameHeader hdr;
         ShmProbeRspMsg body;
     } pkt{};
-    pkt.hdr.size = static_cast<uint16_t>(sizeof(FrameHeader) + sizeof(ShmProbeRspMsg));
+    pkt.hdr.size = static_cast<uint32_t>(sizeof(FrameHeader) + sizeof(ShmProbeRspMsg));
     pkt.hdr.msg_type = kShmProbeRspType;
+    pkt.hdr.flags = 0;
     pkt.hdr.ack_seq = 0;
+    pkt.hdr.reserved = 0;
     pkt.hdr.template convert_byte_order<Config::wire_endian>();
     pkt.body.ack = ack;
     pkt.body.ok = ok;
@@ -214,7 +216,7 @@ template<ConfigConcept Config>
     if (out_ptr) return {};
     std::string path = ptcp_dir + "/" + client_name + ".lastserver";
     auto res = mmap_create_or_open<std::array<char, Config::name_size>>(path.c_str(), false, false);
-    if (!res) return std::unexpected(res.error());
+    if (!res) return make_error(res.error());
     out_ptr = *res;
     return {};
 }
@@ -237,20 +239,20 @@ template<ConfigConcept Config, class Handler>
     if (!parse_ipv4_endpoint(server_ipv4, server_port, server_addr)) {
         Error err{ErrorCode::InvalidAddress, last_socket_error()};
         ClientCallbackBridge<Config, Handler>::on_system_error(handler, err);
-        return std::unexpected(err);
+        return make_error(err);
     }
 
     socket_t fd = create_socket(AF_INET, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) {
         Error err{ErrorCode::SocketCreateFailed, last_socket_error()};
         ClientCallbackBridge<Config, Handler>::on_system_error(handler, err);
-        return std::unexpected(err);
+        return make_error(err);
     }
 
     auto fail = [&](Error err) -> Result<socket_t> {
         close_socket(fd);
         ClientCallbackBridge<Config, Handler>::on_system_error(handler, err);
-        return std::unexpected(err);
+        return make_error(err);
     };
 
     const int timeout_ms = static_cast<int>(
@@ -270,14 +272,16 @@ template<ConfigConcept Config, class Handler>
         return fail(Error{ErrorCode::ConnectFailed, last_socket_error()});
     }
 
-    struct LoginPacket
+    struct alignas(16) LoginPacket
     {
         FrameHeader hdr;
         LoginMsg<Config> body;
     } req_pkt{};
-    req_pkt.hdr.size = static_cast<uint16_t>(sizeof(FrameHeader) + sizeof(LoginMsg<Config>));
+    req_pkt.hdr.size = static_cast<uint32_t>(sizeof(FrameHeader) + sizeof(LoginMsg<Config>));
     req_pkt.hdr.msg_type = kLoginMsgType;
+    req_pkt.hdr.flags = 0;
     req_pkt.hdr.ack_seq = local_ack_seq;
+    req_pkt.hdr.reserved = 0;
     req_pkt.hdr.template convert_byte_order<Config::wire_endian>();
 
     req_pkt.body.magic = kProtocolMagic;
@@ -310,13 +314,13 @@ template<ConfigConcept Config, class Handler>
         close_socket(fd);
         Error err{ErrorCode::ProtocolMismatch, 0};
         ClientCallbackBridge<Config, Handler>::on_system_error(handler, err);
-        return std::unexpected(err);
+        return make_error(err);
     }
     if (login_rsp.server_name[0] == '\0') {
         close_socket(fd);
         Error err{ErrorCode::InvalidLoginRsp, 0};
         ClientCallbackBridge<Config, Handler>::on_system_error(handler, err);
-        return std::unexpected(err);
+        return make_error(err);
     }
 
     if (login_rsp.status != 0) {
@@ -377,7 +381,7 @@ public:
         if (!channel_.is_closed()) {
             Error err{ErrorCode::AlreadyConnected, 0};
             detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, err);
-            return std::unexpected(err);
+            return make_error(err);
         }
         channel_.try_close_fd();
 
@@ -394,7 +398,7 @@ public:
             0, 0, 0, rsp_hdr, login_rsp);
         if (!fd_res) {
             channel_.release();
-            return std::unexpected(fd_res.error());
+            return make_error(fd_res.error());
         }
 
         detail::socket_t fd = *fd_res;
@@ -484,7 +488,7 @@ public:
         if (!channel_.is_closed()) {
             Error err{ErrorCode::AlreadyConnected, 0};
             detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, err);
-            return std::unexpected(err);
+            return make_error(err);
         }
         channel_.try_close_fd();
 
@@ -508,7 +512,7 @@ public:
             if (!seq_res) {
                 channel_.release();
                 detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, seq_res.error());
-                return std::unexpected(seq_res.error());
+                return make_error(seq_res.error());
             }
             local_ack = seq_res->local_ack;
             local_start = seq_res->seq_start;
@@ -524,7 +528,7 @@ public:
             local_ack, local_start, local_end, rsp_hdr, login_rsp);
         if (!fd_res) {
             channel_.release();
-            return std::unexpected(fd_res.error());
+            return make_error(fd_res.error());
         }
 
         detail::socket_t fd = *fd_res;
@@ -622,7 +626,7 @@ public:
         if (!shm_ch_.is_closed() || !tcp_ch_.is_closed()) {
             Error err{ErrorCode::AlreadyConnected, 0};
             detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, err);
-            return std::unexpected(err);
+            return make_error(err);
         }
         shm_ch_.try_close_fd();
         tcp_ch_.try_close_fd();
@@ -649,7 +653,7 @@ public:
             if (!seq_res) {
                 tcp_ch_.release();
                 detail::ClientCallbackBridge<Config, Handler>::on_system_error(handler_, seq_res.error());
-                return std::unexpected(seq_res.error());
+                return make_error(seq_res.error());
             }
             local_ack = seq_res->local_ack;
             local_start = seq_res->seq_start;
@@ -666,7 +670,7 @@ public:
         if (!fd_res) {
             if (use_shm) shm_ch_.release();
             else tcp_ch_.release();
-            return std::unexpected(fd_res.error());
+            return make_error(fd_res.error());
         }
 
         detail::socket_t fd = *fd_res;

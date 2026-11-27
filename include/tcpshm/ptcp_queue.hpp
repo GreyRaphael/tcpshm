@@ -46,14 +46,14 @@ struct PtcpSeqRange
 };
 
 // Pure trivial & standard-layout mmap-able persistent TCP outbound queue.
-// Includes magic, version, and capacity metadata to detect corruption or config mismatch on reopen.
+// Uses 16-byte blocks matching FrameHeader and checks magic/version/capacity/header_size on reopen.
 template<uint32_t Bytes, std::endian WireEndian = std::endian::little>
 struct PtcpQueue
 {
     static constexpr uint64_t kMagic = 0x5453484D50544350ULL; // "TSHMPTCP"
     static constexpr uint32_t kVersion = 2u;
-    static constexpr uint32_t kHdrSz = static_cast<uint32_t>(sizeof(FrameHeader));
-    static_assert(Bytes > 0 && Bytes % kHdrSz == 0, "Bytes must be a positive multiple of 8");
+    static constexpr uint32_t kHdrSz = kFrameHeaderSize;
+    static_assert(Bytes >= kHdrSz && Bytes % kHdrSz == 0, "Bytes must be a positive multiple of 16");
     static constexpr uint32_t kBlkCnt = Bytes / kHdrSz;
     static_assert(kBlkCnt <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "kBlkCnt exceeds int max");
 
@@ -64,19 +64,19 @@ struct PtcpQueue
         magic_ = kMagic;
         version_ = kVersion;
         capacity_bytes_ = Bytes;
+        header_size_ = kHdrSz;
         write_idx_ = 0;
         read_idx_ = 0;
         send_idx_ = 0;
         read_seq_num_ = 0;
         write_seq_num_ = 0;
         ack_seq_num_ = 0;
-        reserved_ = 0;
     }
 
-    [[nodiscard]] FrameHeader* alloc_raw(uint16_t msg_type, uint16_t payload_size) noexcept {
+    [[nodiscard]] FrameHeader* alloc_raw(uint16_t msg_type, uint32_t payload_size) noexcept {
         if (payload_size > kMaxPayloadSize) [[unlikely]] return nullptr;
-        const uint32_t total_size = static_cast<uint32_t>(payload_size) + kHdrSz;
-        const uint32_t blk_sz = (total_size + kHdrSz - 1u) / kHdrSz;
+        const uint32_t total_size = payload_size + kHdrSz;
+        const uint32_t blk_sz = (total_size - 1u) / kHdrSz + 1u;
         if (blk_sz > kBlkCnt) [[unlikely]] return nullptr;
         const uint32_t avail_sz = kBlkCnt - write_idx_;
         if (blk_sz > avail_sz) {
@@ -89,22 +89,22 @@ struct PtcpQueue
             read_idx_ = 0;
         }
         return new (buf_ + static_cast<size_t>(write_idx_) * kHdrSz)
-            FrameHeader{static_cast<uint16_t>(total_size), msg_type, 0};
+            FrameHeader{total_size, msg_type, 0, 0, 0};
     }
 
-    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t msg_type, uint16_t payload_size) noexcept {
+    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t msg_type, uint32_t payload_size) noexcept {
         FrameHeader* hdr = alloc_raw(msg_type, payload_size);
         if (!hdr) return std::nullopt;
         return std::optional<Guard>(std::in_place, this, hdr, payload_size);
     }
 
-    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t payload_size) noexcept {
+    [[nodiscard]] std::optional<Guard> try_alloc(uint32_t payload_size) noexcept {
         return try_alloc(kFirstAppMsgType, payload_size);
     }
 
     void push_pending() noexcept {
         FrameHeader* hdr = blk_at(write_idx_);
-        const uint32_t blk_sz = (static_cast<uint32_t>(hdr->size) + kHdrSz - 1u) / kHdrSz;
+        const uint32_t blk_sz = (hdr->size - 1u) / kHdrSz + 1u;
         hdr->ack_seq = ack_seq_num_;
         hdr->template convert_byte_order<WireEndian>();
         write_idx_ += blk_sz;
@@ -143,10 +143,10 @@ struct PtcpQueue
             if (idx >= write_idx_) return false;
             FrameHeader hdr;
             std::memcpy(&hdr, buf_ + static_cast<size_t>(idx) * kHdrSz, kHdrSz);
-            const uint16_t msg_size = detail::from_wire<WireEndian>(hdr.size);
-            if (msg_size < kHdrSz) return false;
-            const uint32_t step = (static_cast<uint32_t>(msg_size) + kHdrSz - 1u) / kHdrSz;
-            if (idx + step > write_idx_) return false;
+            const uint32_t msg_size = detail::from_wire<WireEndian>(hdr.size);
+            if (msg_size < kHdrSz || msg_size > kMaxFrameSize) return false;
+            const uint32_t step = (msg_size - 1u) / kHdrSz + 1u;
+            if (step > write_idx_ - idx) return false;
             idx += step;
             ++seq;
         }
@@ -163,18 +163,19 @@ struct PtcpQueue
     [[nodiscard]] uint32_t my_ack() const noexcept { return ack_seq_num_; }
 
     [[nodiscard]] Result<PtcpSeqRange> validate_and_get_seq() noexcept {
-        if (magic_ == 0 && version_ == 0 && capacity_bytes_ == 0 &&
+        if (magic_ == 0 && version_ == 0 && capacity_bytes_ == 0 && header_size_ == 0 &&
             write_idx_ == 0 && read_idx_ == 0 && send_idx_ == 0 &&
             read_seq_num_ == 0 && write_seq_num_ == 0 && ack_seq_num_ == 0) {
             magic_ = kMagic;
             version_ = kVersion;
             capacity_bytes_ = Bytes;
+            header_size_ = kHdrSz;
             return PtcpSeqRange{0, 0, 0};
         }
         if (magic_ != kMagic || version_ != kVersion) {
             return make_error(ErrorCode::CorruptPtcpFile);
         }
-        if (capacity_bytes_ != Bytes) {
+        if (capacity_bytes_ != Bytes || header_size_ != kHdrSz) {
             return make_error(ErrorCode::ConfigMismatch);
         }
         if (write_idx_ > kBlkCnt || read_idx_ > write_idx_ ||
@@ -187,14 +188,14 @@ struct PtcpQueue
             FrameHeader hdr;
             std::memcpy(&hdr, buf_ + static_cast<size_t>(idx) * kHdrSz, kHdrSz);
             hdr.template convert_byte_order<WireEndian>();
-            if (hdr.size < kHdrSz) {
+            if (hdr.size < kHdrSz || hdr.size > kMaxFrameSize) {
                 return make_error(ErrorCode::CorruptPtcpFile);
             }
             if (static_cast<int32_t>(ack_seq_num_ - hdr.ack_seq) < 0) {
                 return make_error(ErrorCode::CorruptPtcpFile);
             }
-            const uint32_t step = (static_cast<uint32_t>(hdr.size) + kHdrSz - 1u) / kHdrSz;
-            if (idx + step > write_idx_) {
+            const uint32_t step = (hdr.size - 1u) / kHdrSz + 1u;
+            if (step > write_idx_ - idx) {
                 return make_error(ErrorCode::CorruptPtcpFile);
             }
             idx += step;
@@ -215,13 +216,13 @@ struct PtcpQueue
     uint64_t magic_;
     uint32_t version_;
     uint32_t capacity_bytes_;
+    uint32_t header_size_;
     uint32_t write_idx_;
     uint32_t read_idx_;
     uint32_t send_idx_;
     uint32_t read_seq_num_;
     uint32_t write_seq_num_;
     uint32_t ack_seq_num_;
-    uint32_t reserved_;
     alignas(64) std::byte buf_[Bytes];
 };
 

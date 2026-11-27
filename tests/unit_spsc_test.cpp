@@ -21,62 +21,77 @@ using namespace tcpshm;
         }                                                                                \
     } while (0)
 
+struct alignas(16) Vec16
+{
+    uint64_t hi = 0;
+    uint64_t lo = 0;
+};
+static_assert(alignof(Vec16) == 16 && std::is_trivially_copyable_v<Vec16>);
+
 void test_payload_limit_and_guard_raii() {
     auto q = std::make_unique<SpscQueue<131072>>();
-    for (uint32_t sz = kMaxPayloadSize + 1u; sz <= 65535u; ++sz) {
-        CHECK(!q->try_alloc(1, static_cast<uint16_t>(sz)).has_value());
-    }
+    CHECK(!q->try_alloc(1, kMaxPayloadSize + 1u).has_value());
+    CHECK(!q->try_alloc(1, 0xFFFFFFFFu).has_value());
+    CHECK(!q->try_alloc(1, 131072u).has_value()); // exceeds ring capacity once 16B header is added
+
     // Uncommitted WriteGuard cancels automatically on scope exit
     {
-        auto tx = q->try_alloc(3, kMaxPayloadSize);
+        auto tx = q->try_alloc(3, 131072u - kFrameHeaderSize);
         CHECK(tx.has_value());
-        CHECK(tx->size() == kMaxPayloadSize);
+        CHECK(tx->size() == 131072u - kFrameHeaderSize);
     }
     CHECK(!q->try_front().has_value());
 
-    // Committed WriteGuard is readable and ReadGuard auto-pops
+    // Committed WriteGuard is readable (including flags/meta/reserved) and ReadGuard auto-pops
     {
-        auto tx = q->try_alloc(42, 16);
+        auto tx = q->try_alloc(42, sizeof(Vec16));
         CHECK(tx.has_value());
+        tx->set_flags(0x1234u);
         tx->set_meta(12345u);
-        uint64_t v1 = 0x1122334455667788ULL;
-        CHECK(tx->write_pod(v1));
+        tx->set_reserved(0xABCDEF01u);
+        auto* v = tx->emplace<Vec16>(0x1122334455667788ULL, 0x99AABBCCDDEEFF00ULL);
+        CHECK(v != nullptr);
         tx->commit();
     }
     {
         auto rx = q->try_front();
         CHECK(rx.has_value());
         CHECK(rx->type() == 42);
+        CHECK(rx->flags() == 0x1234u);
         CHECK(rx->meta() == 12345u);
-        CHECK(rx->payload_size() == 16);
-        // Defer prevents pop
+        CHECK(rx->reserved() == 0xABCDEF01u);
+        CHECK(rx->payload_size() == sizeof(Vec16));
+        const Vec16* ptr = rx->view().as_ptr<Vec16>();
+        CHECK(ptr != nullptr);
+        CHECK(reinterpret_cast<std::uintptr_t>(ptr) % 16u == 0u);
+        CHECK(ptr->hi == 0x1122334455667788ULL && ptr->lo == 0x99AABBCCDDEEFF00ULL);
         rx->defer();
     }
     {
         auto rx = q->try_front();
-        CHECK(rx.has_value());
-        CHECK(rx->type() == 42);
+        CHECK(rx.has_value() && rx->type() == 42);
     }
     CHECK(!q->try_front().has_value());
 }
 
 void test_wrap_cancel_and_blk_sizes() {
     auto run_for_blk = []<uint32_t BlkSz>() {
-        auto q = std::make_unique<SpscQueue<256, BlkSz>>();
-        for (int i = 0; i < 3; ++i) {
-            auto tx = q->try_alloc(1, 50);
+        auto q = std::make_unique<SpscQueue<512, BlkSz>>();
+        // Advance write cursor close to ring end (400B out of 512B -> remaining padding < 196B for BlkSz=16/32/64)
+        {
+            auto tx = q->try_alloc(1, 384);
             CHECK(tx.has_value());
             tx->commit();
             auto rx = q->try_front();
-            CHECK(rx.has_value() && rx->payload_size() == 50);
+            CHECK(rx.has_value() && rx->payload_size() == 384);
         }
-        // Trigger rewind alloc, then cancel without committing
+        // Trigger rewind alloc (196B > remaining padding), then cancel without committing
         {
-            auto tx_cancel = q->try_alloc(2, 120);
+            auto tx_cancel = q->try_alloc(2, 180);
             CHECK(tx_cancel.has_value());
             tx_cancel->cancel();
         }
-        // Small message fits before wrap
+        // Small message fits in remaining space before wrap
         {
             auto tx_small = q->try_alloc(7, 20);
             CHECK(tx_small.has_value());
@@ -87,16 +102,23 @@ void test_wrap_cancel_and_blk_sizes() {
             auto rx = q->try_front();
             CHECK(rx.has_value() && rx->type() == 7 && rx->payload_str() == "hello_wrap_cancel_ok");
         }
-        // Now do real rewind commit
+        // Consume filler or advance to near end and verify real rewind commit
         {
-            auto tx_wrap = q->try_alloc(9, 140);
+            auto tx_pad = q->try_alloc(8, 300);
+            CHECK(tx_pad.has_value());
+            tx_pad->commit();
+            auto rx_pad = q->try_front();
+            CHECK(rx_pad.has_value() && rx_pad->type() == 8);
+        }
+        {
+            auto tx_wrap = q->try_alloc(9, 180);
             CHECK(tx_wrap.has_value());
-            std::memset(tx_wrap->data(), 0xCD, 140);
+            std::memset(tx_wrap->data(), 0xCD, 180);
             tx_wrap->commit();
         }
         {
             auto rx = q->try_front();
-            CHECK(rx.has_value() && rx->type() == 9 && rx->payload_size() == 140);
+            CHECK(rx.has_value() && rx->type() == 9 && rx->payload_size() == 180);
             for (std::byte b : rx->payload()) {
                 CHECK(b == std::byte{0xCD});
             }
@@ -109,10 +131,30 @@ void test_wrap_cancel_and_blk_sizes() {
     run_for_blk.template operator()<64>();
 }
 
+void test_large_over_64k_frame() {
+    auto q = std::make_unique<SpscQueue<512u * 1024u, 64>>();
+    constexpr uint32_t kLargeSize = 128u * 1024u; // 128 KiB (> 64 KiB)
+    for (int iter = 0; iter < 5; ++iter) {
+        auto tx = q->try_alloc(77, kLargeSize);
+        CHECK(tx.has_value());
+        tx->set_flags(static_cast<uint16_t>(iter + 1));
+        std::memset(tx->data(), 0x5A + iter, kLargeSize);
+        tx->commit();
+
+        auto rx = q->try_front();
+        CHECK(rx.has_value());
+        CHECK(rx->type() == 77);
+        CHECK(rx->flags() == static_cast<uint16_t>(iter + 1));
+        CHECK(rx->payload_size() == kLargeSize);
+        CHECK(rx->view().data()[0] == std::byte{static_cast<uint8_t>(0x5A + iter)});
+        CHECK(rx->view().data()[kLargeSize - 1] == std::byte{static_cast<uint8_t>(0x5A + iter)});
+    }
+    CHECK(!q->try_front().has_value());
+}
+
 void test_batch_stage_flush_and_drain_backpressure() {
     auto q = std::make_unique<SpscQueue<4096, 32>>();
 
-    // Stage 20 messages before flushing -> consumer must see 0 until flush()
     for (uint32_t i = 0; i < 20; ++i) {
         auto tx = q->try_alloc(10, sizeof(uint32_t));
         CHECK(tx.has_value());
@@ -125,13 +167,12 @@ void test_batch_stage_flush_and_drain_backpressure() {
     q->flush();
     CHECK(!q->producer().has_staged());
 
-    // Drain with backpressure: accept first 7, reject 8th (return false)
     std::vector<uint32_t> received;
     uint32_t n1 = q->drain(
         [&](MsgView msg) -> bool {
             auto val = msg.read_as<uint32_t>();
             CHECK(val.has_value());
-            if (*val == 7u) return false; // backpressure!
+            if (*val == 7u) return false;
             received.push_back(*val);
             return true;
         },
@@ -139,7 +180,6 @@ void test_batch_stage_flush_and_drain_backpressure() {
     CHECK(n1 == 7);
     CHECK(received.size() == 7);
 
-    // Next drain must re-deliver 7 and consume the remaining 13
     uint32_t n2 = q->drain(
         [&](MsgView msg) {
             auto val = msg.read_as<uint32_t>();
@@ -165,7 +205,7 @@ void test_multithreaded_spsc_batch_stress() {
         while (sent < kTotal) {
             uint32_t in_batch = 0;
             while (sent < kTotal && in_batch < kBatch) {
-                uint16_t sz = static_cast<uint16_t>(sizeof(uint64_t) + (sent % 160));
+                uint32_t sz = static_cast<uint32_t>(sizeof(uint64_t) + (sent % 160));
                 auto tx = q->try_alloc(1, sz);
                 if (!tx) {
                     q->flush();
@@ -189,7 +229,7 @@ void test_multithreaded_spsc_batch_stress() {
         while (expected < kTotal) {
             uint32_t n = q->drain(
                 [&](MsgView msg) {
-                    uint16_t expected_sz = static_cast<uint16_t>(sizeof(uint64_t) + (expected % 160));
+                    uint32_t expected_sz = static_cast<uint32_t>(sizeof(uint64_t) + (expected % 160));
                     CHECK(msg.type() == 1);
                     CHECK(msg.payload_size() == expected_sz);
                     uint64_t seq = 0;
@@ -215,6 +255,7 @@ void test_multithreaded_spsc_batch_stress() {
 int main() {
     test_payload_limit_and_guard_raii();
     test_wrap_cancel_and_blk_sizes();
+    test_large_over_64k_frame();
     test_batch_stage_flush_and_drain_backpressure();
     test_multithreaded_spsc_batch_stress();
     std::cout << "unit_spsc_test passed\n";

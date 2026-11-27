@@ -107,7 +107,7 @@ public:
         if (listenfd_ != detail::kInvalidSocket) {
             Error err{ErrorCode::AlreadyStarted, 0};
             notify_system_error(err);
-            return std::unexpected(err);
+            return make_error(err);
         }
 
         for (uint32_t g = 0; g < Config::max_tcp_groups; ++g) {
@@ -129,7 +129,7 @@ public:
                 grp.poller.reset();
             }
             notify_system_error(err);
-            return std::unexpected(err);
+            return make_error(err);
         };
 
         listenfd_ = detail::create_socket(AF_INET, SOCK_STREAM, 0);
@@ -575,8 +575,8 @@ private:
         struct sockaddr_in addr{};
         size_t io_done = 0;
         size_t io_total = 0;
-        alignas(8) std::byte rx_buf[kMaxHandshakeRxSize]{};
-        alignas(8) std::byte tx_buf[kMaxHandshakeTxSize]{};
+        alignas(16) std::byte rx_buf[kMaxHandshakeRxSize]{};
+        alignas(16) std::byte tx_buf[kMaxHandshakeTxSize]{};
 
         // Cached parsed LoginMsg across asynchronous SHM probe steps
         LoginMsg parsed_login{};
@@ -879,7 +879,7 @@ private:
                            uint32_t seq_end,
                            std::string_view err_msg,
                            const typename Config::LoginRspUserData& rsp_user_data = {}) noexcept {
-        FrameHeader hdr{static_cast<uint16_t>(kLoginRspWireSize), detail::kLoginRspMsgType, ack_seq};
+        FrameHeader hdr{static_cast<uint32_t>(kLoginRspWireSize), detail::kLoginRspMsgType, 0u, ack_seq, 0u};
         hdr.template convert_byte_order<Config::wire_endian>();
 
         LoginRspMsg rsp{};
@@ -1033,7 +1033,7 @@ private:
         std::atomic_ref<uint64_t>(p.probe_ptr->token).store(p.probe_token, std::memory_order_relaxed);
         std::atomic_ref<uint64_t>(p.probe_ptr->ack).store(0, std::memory_order_release);
 
-        FrameHeader hdr{static_cast<uint16_t>(kProbeReqWireSize), detail::kShmProbeReqType, 0};
+        FrameHeader hdr{static_cast<uint32_t>(kProbeReqWireSize), detail::kShmProbeReqType, 0u, 0u, 0u};
         hdr.template convert_byte_order<Config::wire_endian>();
 
         detail::ShmProbeReqMsg req{};

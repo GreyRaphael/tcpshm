@@ -172,7 +172,7 @@ void test_slow_client_zero_blocking_and_timeout_cleanup() {
     int probe_stall_fd = connect_raw_tcp(port);
     {
         std::byte buf[sizeof(FrameHeader) + sizeof(detail::LoginMsg<HandshakeTestConfig>)]{};
-        FrameHeader hdr{static_cast<uint16_t>(sizeof(buf)), detail::kLoginMsgType, 0};
+        FrameHeader hdr{static_cast<uint32_t>(sizeof(buf)), detail::kLoginMsgType, 0u, 0u, 0u};
         hdr.convert_byte_order<HandshakeTestConfig::wire_endian>();
         detail::LoginMsg<HandshakeTestConfig> login{};
         login.magic = detail::kProtocolMagic;

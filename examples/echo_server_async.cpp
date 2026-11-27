@@ -96,7 +96,7 @@ private:
                               bool batch_stage = false) {
         const size_t total = sizeof(tcpshm::ConnHandle) + body.size();
         if (total > tcpshm::kMaxPayloadSize) return false;
-        const auto sz = static_cast<uint16_t>(total);
+        const auto sz = static_cast<uint32_t>(total);
 
         auto tx = q.try_alloc(msg_type, sz);
         for (int spin = 0; !tx && spin < 1000 && !stopped.load(std::memory_order_acquire); ++spin) {
@@ -175,7 +175,7 @@ private:
 
                 server_.with_channel(h, [&](auto& ch) {
                     if (body.size() > tcpshm::kMaxPayloadSize) return;
-                    if (auto tx = ch.try_alloc(item.type(), static_cast<uint16_t>(body.size()))) {
+                    if (auto tx = ch.try_alloc(item.type(), static_cast<uint32_t>(body.size()))) {
                         tx->write_bytes(body);
                         tx->commit();
                     }

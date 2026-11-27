@@ -57,7 +57,7 @@ class TcpClient;
 template<class Handler, class Config>
 class Client;
 
-// Dedicated persistent-TCP channel with mmap-backed sequence recovery and branchless TX/RX path.
+// Dedicated persistent-TCP channel with 16B-aligned buffers, mmap-backed sequence recovery, and branchless TX/RX path.
 template<ConfigConcept Config>
 class TcpChannel
 {
@@ -68,9 +68,11 @@ public:
 
     TcpChannel() noexcept {
         remote_name_[0] = '\0';
-        hb_frame_.size = static_cast<uint16_t>(sizeof(FrameHeader));
+        hb_frame_.size = kFrameHeaderSize;
         hb_frame_.msg_type = kHeartbeatMsgType;
+        hb_frame_.flags = 0;
         hb_frame_.ack_seq = 0;
+        hb_frame_.reserved = 0;
         hb_frame_.template convert_byte_order<Config::wire_endian>();
     }
 
@@ -82,7 +84,7 @@ public:
     TcpChannel& operator=(TcpChannel&&) = delete;
 
     // Allocates an outbound frame in persistent queue. commit() pushes and flushes over TCP; stage() batches without send syscall.
-    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t msg_type, uint16_t payload_size) noexcept {
+    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t msg_type, uint32_t payload_size) noexcept {
         if (!q_ || sockfd_.load(std::memory_order_acquire) == detail::kInvalidSocket) [[unlikely]] {
             return std::nullopt;
         }
@@ -91,7 +93,7 @@ public:
         return std::optional<Guard>(std::in_place, this, hdr, payload_size);
     }
 
-    [[nodiscard]] std::optional<Guard> try_alloc(uint16_t payload_size) noexcept {
+    [[nodiscard]] std::optional<Guard> try_alloc(uint32_t payload_size) noexcept {
         return try_alloc(kFirstAppMsgType, payload_size);
     }
 
@@ -152,7 +154,8 @@ private:
     friend class Client;
 
     static constexpr uint32_t kOverflowCap =
-        Config::tcp_recv_max_bytes < 65536u ? Config::tcp_recv_max_bytes : 65536u;
+        Config::tcp_recv_max_bytes < (256u * 1024u) ? Config::tcp_recv_max_bytes : (256u * 1024u);
+    static constexpr uint32_t kMaxIoChunkBytes = 16u * 1024u * 1024u;
 
     void init(const char* ptcp_dir, const char* local_name) noexcept {
         ptcp_dir_ = ptcp_dir;
@@ -168,7 +171,7 @@ private:
         if (!q_) {
             std::string path = ptcp_file_path();
             auto res = detail::mmap_create_or_open<Queue>(path.c_str(), false, false);
-            if (!res) [[unlikely]] return std::unexpected(res.error());
+            if (!res) [[unlikely]] return make_error(res.error());
             q_ = *res;
         }
         return {};
@@ -182,6 +185,7 @@ private:
     void reset_queue() noexcept {
         send_byte_off_ = 0;
         hb_send_off_ = 0;
+        staged_ = false;
         if (q_) q_->reset();
     }
 
@@ -189,6 +193,7 @@ private:
         close_error_ = Error{ErrorCode::Ok, 0};
         send_byte_off_ = 0;
         hb_send_off_ = 0;
+        staged_ = false;
         fd_to_close_ = sock_fd;
         sockfd_.store(sock_fd, std::memory_order_relaxed);
         close_claimed_.store(false, std::memory_order_release);
@@ -200,7 +205,7 @@ private:
         now_ = now;
         if (recvbuf_size_ == 0) {
             recvbuf_size_ = Config::tcp_recv_init_bytes;
-            recvbuf_.reset(new std::byte[recvbuf_size_]);
+            recvbuf_.reset(new FrameHeader[recvbuf_size_ >> kFrameAlignShift]);
         }
         if (q_) {
             q_->login_ack(remote_ack_seq);
@@ -232,17 +237,21 @@ private:
         if (int len = do_recv(fd); len > 0) {
             const uint32_t old_writeidx = writeidx_;
             writeidx_ += static_cast<uint32_t>(len);
-            while (writeidx_ - nextmsg_idx_ >= sizeof(FrameHeader)) {
-                FrameHeader* hdr = std::launder(reinterpret_cast<FrameHeader*>(&recvbuf_[nextmsg_idx_]));
-                if (old_writeidx < nextmsg_idx_ + static_cast<uint32_t>(sizeof(FrameHeader))) {
+            while (writeidx_ - nextmsg_idx_ >= kFrameHeaderSize) {
+                FrameHeader* hdr = rx_hdr_mut(nextmsg_idx_);
+                if (old_writeidx < nextmsg_idx_ + kFrameHeaderSize) {
                     hdr->template convert_byte_order<Config::wire_endian>();
                 }
-                if (hdr->size < sizeof(FrameHeader) ||
-                    (hdr->msg_type == kHeartbeatMsgType && hdr->size != sizeof(FrameHeader))) [[unlikely]] {
+                if (hdr->size < kFrameHeaderSize ||
+                    (hdr->msg_type == kHeartbeatMsgType && hdr->size != kFrameHeaderSize)) [[unlikely]] {
                     close_with(Error{ErrorCode::InvalidMsgHeader, 0});
                     return 0;
                 }
-                const uint32_t msg_bytes = (static_cast<uint32_t>(hdr->size) + 7u) & ~7u;
+                if (hdr->size > Config::tcp_recv_max_bytes) [[unlikely]] {
+                    close_with(Error{ErrorCode::MsgTooLarge, 0});
+                    return 0;
+                }
+                const uint32_t msg_bytes = align_frame_size(hdr->size);
                 if (msg_bytes > Config::tcp_recv_max_bytes) [[unlikely]] {
                     close_with(Error{ErrorCode::MsgTooLarge, 0});
                     return 0;
@@ -323,6 +332,7 @@ private:
         try_close_fd();
         send_byte_off_ = 0;
         hb_send_off_ = 0;
+        staged_ = false;
         overflow_buf_.reset();
         remote_name_[0] = '\0';
         handle_ = ConnHandle{};
@@ -335,28 +345,44 @@ private:
     typename Config::ConnectionUserData user_data{};
 
 private:
+    [[nodiscard]] char* recv_bytes_ptr(uint32_t byte_off = 0) noexcept {
+        return reinterpret_cast<char*>(recvbuf_.get()) + byte_off;
+    }
+
+    [[nodiscard]] FrameHeader* rx_hdr_mut(uint32_t byte_off) noexcept {
+        return std::launder(reinterpret_cast<FrameHeader*>(
+            reinterpret_cast<std::byte*>(recvbuf_.get()) + byte_off));
+    }
+
+    [[nodiscard]] const FrameHeader* rx_hdr(uint32_t byte_off) const noexcept {
+        return std::launder(reinterpret_cast<const FrameHeader*>(
+            reinterpret_cast<const std::byte*>(recvbuf_.get()) + byte_off));
+    }
+
     template<typename Fn>
         requires std::invocable<Fn&, MsgView>
     uint32_t dispatch_buffered(Fn&& fn, uint32_t max_batch) {
         uint32_t consumed = 0;
         while (readidx_ != nextmsg_idx_ && consumed < max_batch) {
-            const FrameHeader* hdr = std::launder(reinterpret_cast<const FrameHeader*>(&recvbuf_[readidx_]));
+            const FrameHeader* hdr = rx_hdr(readidx_);
             if (hdr->msg_type == kHeartbeatMsgType) {
-                readidx_ += static_cast<uint32_t>(sizeof(FrameHeader));
+                readidx_ += kFrameHeaderSize;
                 continue;
             }
-            const uint32_t msg_bytes = (static_cast<uint32_t>(hdr->size) + 7u) & ~7u;
+            const uint32_t msg_bytes = align_frame_size(hdr->size);
             MsgView view{hdr};
+            // Pre-increment my_ack so replies sent inside fn(view) piggyback this ACK immediately; roll back on backpressure.
+            ++q_->my_ack();
             using Ret = std::invoke_result_t<Fn&, MsgView>;
             if constexpr (std::same_as<Ret, bool>) {
                 if (!fn(view)) {
+                    --q_->my_ack();
                     break;
                 }
             } else {
                 fn(view);
             }
             readidx_ += msg_bytes;
-            ++q_->my_ack();
             ++consumed;
             if (sockfd_.load(std::memory_order_acquire) == detail::kInvalidSocket) [[unlikely]] {
                 staged_ = false;
@@ -380,11 +406,11 @@ private:
             hb_frame_.ack_seq = detail::to_wire<Config::wire_endian>(q_->my_ack());
         }
         const char* base = reinterpret_cast<const char*>(&hb_frame_);
-        while (hb_send_off_ < sizeof(FrameHeader)) {
-            int remain = static_cast<int>(sizeof(FrameHeader) - hb_send_off_);
-            int sent = detail::send_bytes(fd, base + hb_send_off_, remain, detail::kMsgNoSignal);
+        while (hb_send_off_ < kFrameHeaderSize) {
+            const int remain = static_cast<int>(kFrameHeaderSize - hb_send_off_);
+            const int sent = detail::send_bytes(fd, base + hb_send_off_, remain, detail::kMsgNoSignal);
             if (sent < 0) {
-                int err = detail::last_socket_error();
+                const int err = detail::last_socket_error();
                 if (detail::is_retryable_err(err)) return;
                 close_with(Error{ErrorCode::SendFailed, err});
                 return;
@@ -406,30 +432,32 @@ private:
             send_byte_off_ = 0;
             return false;
         }
-        const uint32_t total_bytes = (blk_sz << 3u) - send_byte_off_;
+        const uint64_t total_bytes = (static_cast<uint64_t>(blk_sz) << kFrameAlignShift) - send_byte_off_;
         const char* p = base + send_byte_off_;
-        uint32_t sent_total = 0;
+        uint64_t sent_total = 0;
         while (sent_total < total_bytes) {
-            int sent = detail::send_bytes(fd, p + sent_total, static_cast<int>(total_bytes - sent_total), detail::kMsgNoSignal);
+            const uint64_t remain = total_bytes - sent_total;
+            const int chunk = static_cast<int>(std::min<uint64_t>(remain, kMaxIoChunkBytes));
+            const int sent = detail::send_bytes(fd, p + sent_total, chunk, detail::kMsgNoSignal);
             if (sent <= 0) [[unlikely]] {
                 if (sent == 0) {
                     close_with(Error{ErrorCode::SendFailed, 0});
                     return false;
                 }
-                int err = detail::last_socket_error();
+                const int err = detail::last_socket_error();
                 if (detail::is_retryable_err(err)) {
                     break;
                 }
                 close_with(Error{ErrorCode::SendFailed, err});
                 return false;
             }
-            sent_total += static_cast<uint32_t>(sent);
+            sent_total += static_cast<uint64_t>(sent);
         }
         if (sent_total > 0) {
             send_time_ = now_;
-            const uint32_t total_consumed = static_cast<uint32_t>(send_byte_off_) + sent_total;
-            const uint32_t sent_blk = total_consumed >> 3u;
-            send_byte_off_ = static_cast<uint8_t>(total_consumed & 7u);
+            const uint64_t total_consumed = static_cast<uint64_t>(send_byte_off_) + sent_total;
+            const uint32_t sent_blk = static_cast<uint32_t>(total_consumed >> kFrameAlignShift);
+            send_byte_off_ = static_cast<uint8_t>(total_consumed & kFrameAlignMask);
             if (sent_blk > 0) {
                 q_->on_sent_blocks(sent_blk);
             }
@@ -454,13 +482,14 @@ private:
         }
         int ret = 0;
         if (extra_size == 0) [[likely]] {
-            ret = detail::recv_bytes(fd, reinterpret_cast<char*>(&recvbuf_[writeidx_]), static_cast<int>(writable), 0);
+            const uint32_t chunk = std::min(writable, kMaxIoChunkBytes);
+            ret = detail::recv_bytes(fd, recv_bytes_ptr(writeidx_), static_cast<int>(chunk), 0);
         } else {
             if (!overflow_buf_) [[unlikely]] {
-                overflow_buf_.reset(new std::byte[kOverflowCap]);
+                overflow_buf_.reset(new FrameHeader[kOverflowCap >> kFrameAlignShift]);
             }
             detail::iovec vec[2]{};
-            vec[0].iov_base = &recvbuf_[writeidx_];
+            vec[0].iov_base = recv_bytes_ptr(writeidx_);
             vec[0].iov_len = writable;
             vec[1].iov_base = overflow_buf_.get();
             vec[1].iov_len = extra_size;
@@ -468,7 +497,7 @@ private:
         }
         if (ret <= 0) {
             if (ret < 0) [[likely]] {
-                int err = detail::last_socket_error();
+                const int err = detail::last_socket_error();
                 if (detail::is_retryable_err(err)) [[likely]] {
                     if (now_ - recv_time_ > Config::connection_timeout) [[unlikely]] {
                         close_with(Error{ErrorCode::Timeout, 0});
@@ -485,14 +514,15 @@ private:
         if (ret <= static_cast<int>(writable)) [[likely]] return ret;
         const uint32_t uret = static_cast<uint32_t>(ret);
         if (uret <= writable + readidx_) {
-            std::memmove(&recvbuf_[0], &recvbuf_[readidx_], recvbuf_size_ - readidx_);
-            std::memcpy(&recvbuf_[recvbuf_size_ - readidx_], overflow_buf_.get(), uret - writable);
+            std::memmove(recv_bytes_ptr(0), recv_bytes_ptr(readidx_), recvbuf_size_ - readidx_);
+            std::memcpy(recv_bytes_ptr(recvbuf_size_ - readidx_), overflow_buf_.get(), uret - writable);
         } else {
-            const uint32_t needed = (writeidx_ - readidx_ + uret + 7u) & ~7u;
+            const uint32_t needed = align_frame_size(writeidx_ - readidx_ + uret);
             const uint32_t newbufsize = std::min(Config::tcp_recv_max_bytes, std::max(recvbuf_size_ * 2u, needed));
-            std::unique_ptr<std::byte[]> new_buf(new std::byte[newbufsize]);
-            std::memcpy(&new_buf[0], &recvbuf_[readidx_], recvbuf_size_ - readidx_);
-            std::memcpy(&new_buf[recvbuf_size_ - readidx_], overflow_buf_.get(), uret - writable);
+            std::unique_ptr<FrameHeader[]> new_buf(new FrameHeader[newbufsize >> kFrameAlignShift]);
+            char* new_bytes = reinterpret_cast<char*>(new_buf.get());
+            std::memcpy(new_bytes, recv_bytes_ptr(readidx_), recvbuf_size_ - readidx_);
+            std::memcpy(new_bytes + (recvbuf_size_ - readidx_), overflow_buf_.get(), uret - writable);
             recvbuf_size_ = newbufsize;
             std::swap(recvbuf_, new_buf);
         }
@@ -513,8 +543,8 @@ private:
     detail::socket_t fd_to_close_ = detail::kInvalidSocket;
     Error close_error_{};
 
-    std::unique_ptr<std::byte[]> recvbuf_;
-    std::unique_ptr<std::byte[]> overflow_buf_;
+    std::unique_ptr<FrameHeader[]> recvbuf_;
+    std::unique_ptr<FrameHeader[]> overflow_buf_;
     uint32_t recvbuf_size_ = 0;
     uint32_t writeidx_ = 0;
     uint32_t nextmsg_idx_ = 0;
