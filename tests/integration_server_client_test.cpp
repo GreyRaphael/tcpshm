@@ -11,14 +11,23 @@
 #include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
 using namespace tcpshm;
+
+int current_pid() noexcept {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<int>(::getpid());
+#endif
+}
 
 #define CHECK(cond)                                                                      \
     do {                                                                                 \
@@ -86,17 +95,17 @@ struct CleanupGuard
 };
 
 uint16_t pick_unused_port() {
-    int s = ::socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(s >= 0);
+    detail::socket_t s = detail::create_socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(s != detail::kInvalidSocket);
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    CHECK(::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
     addr.sin_port = 0;
-    CHECK(::bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+    CHECK(detail::bind_socket(s, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) == 0);
     socklen_t len = sizeof(addr);
     CHECK(::getsockname(s, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0);
     uint16_t port = ntohs(addr.sin_port);
-    ::close(s);
+    detail::close_socket(s);
     return port;
 }
 
@@ -180,7 +189,7 @@ template<template<uint32_t> class TcpPoller>
 void run_end_to_end_suite(std::string_view tag) {
     CleanupGuard cg;
     cg.dir = (std::filesystem::temp_directory_path() /
-              ("tcpshm_v2_e2e_" + std::string(tag) + "_" + std::to_string(::getpid())))
+              ("tcpshm_v2_e2e_" + std::string(tag) + "_" + std::to_string(current_pid())))
                  .string();
     std::filesystem::remove_all(cg.dir);
     std::filesystem::create_directories(cg.dir);
@@ -339,7 +348,7 @@ template<template<uint32_t> class TcpPoller>
 void run_large_over_64k_suite(std::string_view tag) {
     CleanupGuard cg;
     cg.dir = (std::filesystem::temp_directory_path() /
-              ("tcpshm_v2_big_" + std::string(tag) + "_" + std::to_string(::getpid())))
+              ("tcpshm_v2_big_" + std::string(tag) + "_" + std::to_string(current_pid())))
                  .string();
     std::filesystem::remove_all(cg.dir);
     std::filesystem::create_directories(cg.dir);

@@ -40,9 +40,9 @@ SOFTWARE.
 #define NOMINMAX
 #endif
 #include <direct.h>
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #endif
@@ -330,7 +330,8 @@ inline void copy_cstr(char* dst, size_t dst_sz, const char* src) noexcept {
 [[nodiscard]] inline bool is_valid_peer_name(std::string_view name) noexcept {
     if (name.empty()) return false;
     if (name.find("..") != std::string_view::npos) return false;
-    for (unsigned char c : std::span<const char>{name.data(), name.size()}) {
+    for (char ch : name) {
+        const auto c = static_cast<unsigned char>(ch);
         if (c == '/' || c == '\\' || c < 0x20 || c >= 0x7f) return false;
     }
     return true;
@@ -341,7 +342,8 @@ inline void copy_cstr(char* dst, size_t dst_sz, const char* src) noexcept {
     if (!name.starts_with(kPrefix)) return false;
     if (name.find("..") != std::string_view::npos) return false;
     std::string_view tail = name.substr(1);
-    for (unsigned char c : std::span<const char>{tail.data(), tail.size()}) {
+    for (char ch : tail) {
+        const auto c = static_cast<unsigned char>(ch);
         if (c == '/' || c == '\\' || c < 0x20 || c >= 0x7f) return false;
     }
     return true;

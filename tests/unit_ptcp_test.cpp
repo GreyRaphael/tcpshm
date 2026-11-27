@@ -8,13 +8,23 @@
 #include <memory>
 #include <string>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
 #endif
 
 namespace {
 
 using namespace tcpshm;
+
+int current_pid() noexcept {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<int>(::getpid());
+#endif
+}
 
 #define CHECK(cond)                                                                      \
     do {                                                                                 \
@@ -93,7 +103,7 @@ void test_ptcp_seq_uint32_wraparound() {
 
 void test_ptcp_mmap_persistence_and_corruption() {
     namespace fs = std::filesystem;
-    std::string dir = (fs::temp_directory_path() / ("tcpshm_v2_ptcp_test_" + std::to_string(::getpid()))).string();
+    std::string dir = (fs::temp_directory_path() / ("tcpshm_v2_ptcp_test_" + std::to_string(current_pid()))).string();
     fs::remove_all(dir);
     fs::create_directories(dir);
     std::string path = dir + "/peer.ptcp";

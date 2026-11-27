@@ -1,21 +1,31 @@
 #include "tcpshm/tcpshm.hpp"
-#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <netinet/in.h>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
 using namespace tcpshm;
+
+int current_pid() noexcept {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<int>(::getpid());
+#endif
+}
 
 #define CHECK(cond)                                                                      \
     do {                                                                                 \
@@ -68,28 +78,26 @@ struct CleanupGuard
 };
 
 uint16_t pick_unused_port() {
-    int s = ::socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(s >= 0);
+    detail::socket_t s = detail::create_socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(s != detail::kInvalidSocket);
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    CHECK(::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
     addr.sin_port = 0;
-    CHECK(::bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+    CHECK(detail::bind_socket(s, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) == 0);
     socklen_t len = sizeof(addr);
     CHECK(::getsockname(s, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0);
     uint16_t port = ntohs(addr.sin_port);
-    ::close(s);
+    detail::close_socket(s);
     return port;
 }
 
-int connect_raw_tcp(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(fd >= 0);
+detail::socket_t connect_raw_tcp(uint16_t port) {
+    detail::socket_t fd = detail::create_socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd != detail::kInvalidSocket);
     struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    addr.sin_port = htons(port);
-    CHECK(::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+    CHECK(detail::parse_ipv4_endpoint("127.0.0.1", port, addr));
+    CHECK(detail::connect_socket(fd, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) == 0);
     return fd;
 }
 
@@ -138,7 +146,7 @@ struct TestClientHandler
 
 void test_slow_client_zero_blocking_and_timeout_cleanup() {
     CleanupGuard cg;
-    cg.dir = (std::filesystem::temp_directory_path() / ("tcpshm_v2_hs1_" + std::to_string(::getpid()))).string();
+    cg.dir = (std::filesystem::temp_directory_path() / ("tcpshm_v2_hs1_" + std::to_string(current_pid()))).string();
     std::filesystem::remove_all(cg.dir);
     std::filesystem::create_directories(cg.dir);
     cg.track_pair("srv_hs1", "fast_cli");
@@ -166,10 +174,10 @@ void test_slow_client_zero_blocking_and_timeout_cleanup() {
     });
 
     // 1. Slow stalled TCP client (connects and sends nothing)
-    int stalled_fd = connect_raw_tcp(port);
+    detail::socket_t stalled_fd = connect_raw_tcp(port);
 
     // 2. Stalled SHM probe client (sends valid LoginMsg with use_shm=1, receives ShmProbeReq, never replies!)
-    int probe_stall_fd = connect_raw_tcp(port);
+    detail::socket_t probe_stall_fd = connect_raw_tcp(port);
     {
         std::byte buf[sizeof(FrameHeader) + sizeof(detail::LoginMsg<HandshakeTestConfig>)]{};
         FrameHeader hdr{static_cast<uint32_t>(sizeof(buf)), detail::kLoginMsgType, 0u, 0u, 0u};
@@ -211,15 +219,15 @@ void test_slow_client_zero_blocking_and_timeout_cleanup() {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     // Polling stalled sockets should hit EOF because server closed timed-out handshakes
     char junk = 0;
-    CHECK(::recv(stalled_fd, &junk, 1, 0) == 0);
+    CHECK(detail::recv_bytes(stalled_fd, &junk, 1, 0) == 0);
     // probe_stall_fd got ShmProbeReq first, drain it then verify EOF
     std::byte drain_buf[256]{};
-    ssize_t r1 = ::recv(probe_stall_fd, drain_buf, sizeof(drain_buf), 0);
+    int r1 = detail::recv_bytes(probe_stall_fd, reinterpret_cast<char*>(drain_buf), static_cast<int>(sizeof(drain_buf)), 0);
     CHECK(r1 > 0);
-    CHECK(::recv(probe_stall_fd, drain_buf, sizeof(drain_buf), 0) == 0);
+    CHECK(detail::recv_bytes(probe_stall_fd, reinterpret_cast<char*>(drain_buf), static_cast<int>(sizeof(drain_buf)), 0) == 0);
 
-    ::close(stalled_fd);
-    ::close(probe_stall_fd);
+    detail::close_socket(stalled_fd);
+    detail::close_socket(probe_stall_fd);
 
     // Ensure poll_ctl never blocked anywhere near v1's 300ms (check < 30ms even under sanitizers/CI jitter)
     CHECK(max_poll_ctl_ns.load() < 30'000'000LL);
@@ -231,7 +239,7 @@ void test_slow_client_zero_blocking_and_timeout_cleanup() {
 
 void test_rejections_and_generational_handle_aba() {
     CleanupGuard cg;
-    cg.dir = (std::filesystem::temp_directory_path() / ("tcpshm_v2_hs2_" + std::to_string(::getpid()))).string();
+    cg.dir = (std::filesystem::temp_directory_path() / ("tcpshm_v2_hs2_" + std::to_string(current_pid()))).string();
     std::filesystem::remove_all(cg.dir);
     std::filesystem::create_directories(cg.dir);
     cg.track_pair("srv_hs2", "cli_a");

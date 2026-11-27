@@ -1,7 +1,6 @@
 #include "common.hpp"
 #include "tcpshm/tcpshm.hpp"
 
-#include <arpa/inet.h>
 #include <atomic>
 #include <csignal>
 #include <cstdio>
