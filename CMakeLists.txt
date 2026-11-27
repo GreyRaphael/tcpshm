@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(tcpshm VERSION 2.1.0 LANGUAGES CXX)
+project(tcpshm VERSION 2.1.1 LANGUAGES CXX)
 
 string(COMPARE EQUAL "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}" TCPSHM_IS_TOP_LEVEL)
 

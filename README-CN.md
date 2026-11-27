@@ -75,7 +75,7 @@ include(FetchContent)
 FetchContent_Declare(
   tcpshm
   GIT_REPOSITORY https://github.com/GreyRaphael/tcpshm.git
-  GIT_TAG v2.1.0
+  GIT_TAG v2.1.1
 )
 FetchContent_MakeAvailable(tcpshm)
 target_link_libraries(your_app PRIVATE tcpshm::tcpshm)
