@@ -764,7 +764,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(dir);
 
     std::cout << std::format(
-        "tcpshm v2.0 C++20 (16B Header) Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={}, recv={})\n",
+        "tcpshm v2.1 C++20 (16B Header) Benchmark | iters={} | warmup={} | ShmQueue={} KiB | TcpQueue={} KiB | pin(srv={}, cli={}, recv={})\n",
         opts.iters,
         opts.warmup,
         BenchConfig::shm_queue_bytes / 1024u,
