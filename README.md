@@ -34,21 +34,105 @@ User payloads are framed by a **16-byte `alignas(16)` `FrameHeader`** (supportin
 * [`server.hpp`](include/tcpshm/server.hpp) & [`client.hpp`](include/tcpshm/client.hpp): Composition-based `Server`, `ShmClient`, `TcpClient`, and runtime-selectable `Client`.
 * `detail/`: Platform abstractions ([`os_socket.hpp`](include/tcpshm/detail/os_socket.hpp), [`os_shm.hpp`](include/tcpshm/detail/os_shm.hpp), [`endian.hpp`](include/tcpshm/detail/endian.hpp), [`protocol.hpp`](include/tcpshm/detail/protocol.hpp)).
 
-## Build & CMake Integration
+## Build & Integration
 
-Requires a C++20 compiler (tested with GCC 14.2 under both `-std=c++20` and `-std=c++23` on Linux; Windows WinSock2 support is preserved in `detail/`).
+### Requirements
+
+* **C++20 compiler**: GCC >= 11 / Clang >= 14 / MSVC 2022+ (Linux & Windows; note `tcpshm_bench` uses C++20 `<format>`, requiring GCC >= 13 / Clang >= 17 / MSVC 2022+ when `TCPSHM_BUILD_BENCHMARKS=ON`)
+* **CMake >= 3.16**
+
+### Local Build & Test
 
 ```bash
+git clone https://github.com/GreyRaphael/tcpshm.git
+cd tcpshm
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Downstream CMake projects can consume `tcpshm::tcpshm` directly (`find_package(tcpshm CONFIG REQUIRED)` after `cmake --install`, or `add_subdirectory`):
+Common CMake options:
+
+| Option | Default | Description |
+| :--- | :---: | :--- |
+| `TCPSHM_BUILD_TESTS` | `ON` (top-level) | Build the 4 CTest unit and integration suites in `tests/` |
+| `TCPSHM_BUILD_EXAMPLES` | `ON` (top-level) | Build the 3 usage examples in `examples/` |
+| `TCPSHM_BUILD_BENCHMARKS` | `ON` (top-level) | Build `tcpshm_bench` in `benchmarks/` |
+
+### CMake `add_subdirectory` / `FetchContent` Integration
+
+Option 1 — `add_subdirectory`:
 
 ```cmake
-target_link_libraries(my_app PRIVATE tcpshm::tcpshm)
+add_subdirectory(tcpshm)
+target_link_libraries(your_app PRIVATE tcpshm::tcpshm)
 ```
+
+Option 2 — `FetchContent`:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+  tcpshm
+  GIT_REPOSITORY https://github.com/GreyRaphael/tcpshm.git
+  GIT_TAG v2.1.0
+)
+FetchContent_MakeAvailable(tcpshm)
+target_link_libraries(your_app PRIVATE tcpshm::tcpshm)
+```
+
+When included as a subproject, `TCPSHM_BUILD_TESTS`, `TCPSHM_BUILD_EXAMPLES`, and `TCPSHM_BUILD_BENCHMARKS` automatically default to `OFF`. Linking `tcpshm::tcpshm` automatically configures `cxx_std_20`, include directories, `Threads::Threads`, `rt` (Linux), and `ws2_32` / `/utf-8` (Windows/MSVC).
+
+### Direct Compilation without CMake
+
+No CMake setup is required — add `-Iinclude` and enable C++20:
+
+```bash
+# Linux
+g++ -std=c++20 -O3 -Iinclude your_app.cpp -pthread -lrt -o your_app
+```
+
+```powershell
+# Windows (MSVC Developer Command Prompt)
+cl /std:c++20 /O2 /utf-8 /Iinclude your_app.cpp ws2_32.lib
+```
+
+### Copying Headers into a Third-Party Project (`third_party/`)
+
+To vendor `tcpshm` directly into your project's `third_party/` directory without git submodules or `FetchContent` (you can also extract `tcpshm-vX.Y.Z-headers.tar.gz` / `.zip` from [GitHub Releases](https://github.com/GreyRaphael/tcpshm/releases)), use the following layout:
+
+```text
+your_project/
+├── include/
+├── src/
+│   └── main.cpp
+└── third_party/
+    └── tcpshm/             # copied from include/tcpshm/ (or Release bundle)
+        ├── detail/
+        ├── client.hpp
+        ├── server.hpp
+        └── tcpshm.hpp ...
+```
+
+**3 important notes**:
+1. **The include search path must include `third_party`** (because internal headers use `#include "tcpshm/..."`):
+   * **CMake**:
+     ```cmake
+     find_package(Threads REQUIRED)
+     target_include_directories(your_app PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
+     target_compile_features(your_app PRIVATE cxx_std_20)
+     target_link_libraries(your_app PRIVATE
+       Threads::Threads
+       $<$<PLATFORM_ID:Linux>:rt>
+       $<$<PLATFORM_ID:Windows>:ws2_32>
+     )
+     ```
+   * **Direct CLI compilation**:
+     ```bash
+     g++ -std=c++20 -O3 -Iinclude -Ithird_party src/main.cpp -pthread -lrt -o your_app
+     ```
+2. **Include `#include "tcpshm/tcpshm.hpp"` directly** in your application code: do NOT write `#include "third_party/tcpshm/tcpshm.hpp"` without `-Ithird_party`, or internal header includes will fail to resolve.
+3. **Zero third-party dependencies for the core library**: `include/tcpshm/` relies solely on the C++20 standard library and OS runtime libraries (`-pthread -lrt` on Linux; `ws2_32` on Windows, auto-linked via `#pragma comment(lib, "ws2_32.lib")` on MSVC). Note that `third_party/iguana` and `third_party/frozen` in this repository are only used by `examples/` and do not need to be copied.
 
 ## Documentation & Examples
 
@@ -58,13 +142,12 @@ target_link_libraries(my_app PRIVATE tcpshm::tcpshm)
 
 ## Testing & Verification
 
-CTest runs 4 unit/integration suites plus `-fno-exceptions` compile verification and a benchmark smoke check:
+CTest runs 4 unit and integration suites (`-fno-exceptions -Werror` strict compilation and benchmark smoke runs are enforced in GitHub Actions CI):
 
 * [`tests/unit_spsc_test.cpp`](tests/unit_spsc_test.cpp): Payload bounds (`kMaxPayloadSize`), `alignas(16)` zero-copy `emplace`/`as_ptr`, >64 KiB (`128 KiB`) transfers, wrap-around cancel safety, `BlkSz` 16/32/64, batch `stage()+flush()`, `drain()` backpressure, multi-thread SPSC stress.
 * [`tests/unit_ptcp_test.cpp`](tests/unit_ptcp_test.cpp): Persist/reopen recovery (including `128 KiB` large frames), `uint32_t` sequence wraparound, corrupt magic & capacity/`header_size` mismatch detection.
 * [`tests/integration_handshake_test.cpp`](tests/integration_handshake_test.cpp): Non-blocking `poll_ctl` under stalled TCP & stalled SHM-probe clients, config mismatch/invalid name/duplicate login/capacity rejection, generational `ConnHandle` ABA protection.
 * [`tests/integration_server_client_test.cpp`](tests/integration_server_client_test.cpp): End-to-end SHM, `BusyPoller` TCP, and Linux `EpollPoller` TCP suites including backpressure, >64 KiB (`128 KiB + 13B`) round-trips with immediate ACK piggyback, `flags`/`reserved` metadata preservation, reconnect persistence, and sequence mismatch handling.
-* [`tests/noexcept_compile_check.cpp`](tests/noexcept_compile_check.cpp): Enforces `-fno-exceptions -Werror` compilation of all core headers.
 
 ## Benchmark Comparison (`v1.0.0` vs `v2-8B/C++23` vs `v2-16B/C++20`)
 
@@ -75,11 +158,11 @@ Measured on the same Linux host (AMD Ryzen 7 255, GCC 14.2.0 `-O3 -DNDEBUG`) wit
 * `--pin-recv=<core>`: pins the dedicated SHM pipelined-throughput receiver thread (`recv_thr`).
 
 ```bash
-./build/tcpshm_bench --mode=spsc       --iters=3000000 --warmup=100000 --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2
-./build/tcpshm_bench --mode=rtt        --iters=50000   --warmup=5000   --sizes=16,64,256       --pin-server=0 --pin-client=2
-./build/tcpshm_bench --mode=throughput --iters=400000  --warmup=30000  --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2 --pin-recv=4
+./build/benchmarks/tcpshm_bench --mode=spsc       --iters=3000000 --warmup=100000 --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2
+./build/benchmarks/tcpshm_bench --mode=rtt        --iters=50000   --warmup=5000   --sizes=16,64,256       --pin-server=0 --pin-client=2
+./build/benchmarks/tcpshm_bench --mode=throughput --iters=400000  --warmup=30000  --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2 --pin-recv=4
 # >64 KiB large-frame RTT example (unpinned):
-./build/tcpshm_bench --mode=rtt        --iters=2000    --warmup=200    --sizes=131072
+./build/benchmarks/tcpshm_bench --mode=rtt        --iters=2000    --warmup=200    --sizes=131072
 ```
 
 ### Pinned Cross-Version Comparison (`16B / 64B / 256B`)

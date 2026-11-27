@@ -34,21 +34,105 @@
 * [`server.hpp`](include/tcpshm/server.hpp) 与 [`client.hpp`](include/tcpshm/client.hpp)：组合式 `Server`、`ShmClient`、`TcpClient` 及运行时可切换 `Client`。
 * `detail/`：底层跨平台抽象（[`os_socket.hpp`](include/tcpshm/detail/os_socket.hpp)、[`os_shm.hpp`](include/tcpshm/detail/os_shm.hpp)、[`endian.hpp`](include/tcpshm/detail/endian.hpp)、[`protocol.hpp`](include/tcpshm/detail/protocol.hpp)）。
 
-## 构建与 CMake 集成
+## 构建与集成
 
-仅要求 C++20 编译器（已在 Linux GCC 14.2.0 `-std=c++20` 与 `-std=c++23` 下全面验证，Windows WinSock2 支持保留在 `detail/` 中）。
+### 环境要求
+
+* **C++20 编译器**：GCC >= 11 / Clang >= 14 / MSVC 2022+（支持 Linux / Windows；注意 `tcpshm_bench` 使用 C++20 `<format>`，开启 `TCPSHM_BUILD_BENCHMARKS=ON` 时需 GCC >= 13 / Clang >= 17 / MSVC 2022+）
+* **CMake >= 3.16**
+
+### 本地构建与测试
 
 ```bash
+git clone https://github.com/GreyRaphael/tcpshm.git
+cd tcpshm
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-支持标准 `cmake --install` 安装与 `find_package(tcpshm CONFIG REQUIRED)` 导入，下游直接链接纯头文件目标：
+常用 CMake 选项：
+
+| 选项 | 默认值 | 说明 |
+| :--- | :---: | :--- |
+| `TCPSHM_BUILD_TESTS` | 顶层构建 `ON` | 构建 `tests/` 中的 4 组 CTest 单元与集成测试 |
+| `TCPSHM_BUILD_EXAMPLES` | 顶层构建 `ON` | 构建 `examples/` 中的 3 个使用示例 |
+| `TCPSHM_BUILD_BENCHMARKS` | 顶层构建 `ON` | 构建 `benchmarks/` 性能基准测试程序 `tcpshm_bench` |
+
+### CMake `add_subdirectory` / `FetchContent` 集成
+
+方式一 — `add_subdirectory`：
 
 ```cmake
-target_link_libraries(my_app PRIVATE tcpshm::tcpshm)
+add_subdirectory(tcpshm)
+target_link_libraries(your_app PRIVATE tcpshm::tcpshm)
 ```
+
+方式二 — `FetchContent`：
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+  tcpshm
+  GIT_REPOSITORY https://github.com/GreyRaphael/tcpshm.git
+  GIT_TAG v2.1.0
+)
+FetchContent_MakeAvailable(tcpshm)
+target_link_libraries(your_app PRIVATE tcpshm::tcpshm)
+```
+
+作为子项目引入时，`TCPSHM_BUILD_TESTS`、`TCPSHM_BUILD_EXAMPLES` 与 `TCPSHM_BUILD_BENCHMARKS` 会自动默认为 `OFF`。链接 `tcpshm::tcpshm` 会自动配置 `cxx_std_20`、头文件目录、`Threads::Threads`、Linux `rt` 及 Windows `ws2_32` / `/utf-8`。
+
+### 零 CMake 直接编译
+
+无需任何 CMake 配置，只需添加 `include` 路径并开启 C++20：
+
+```bash
+# Linux
+g++ -std=c++20 -O3 -Iinclude your_app.cpp -pthread -lrt -o your_app
+```
+
+```powershell
+# Windows (MSVC Developer Command Prompt)
+cl /std:c++20 /O2 /utf-8 /Iinclude your_app.cpp ws2_32.lib
+```
+
+### 拷贝头文件到第三方项目（`third_party/`）集成
+
+若希望直接将本库头文件拷贝至业务项目的 `third_party/` 目录免子模块集成（也可直接从 [GitHub Releases](https://github.com/GreyRaphael/tcpshm/releases) 下载解压 `tcpshm-vX.Y.Z-headers.tar.gz` / `.zip`），推荐目录结构如下：
+
+```text
+your_project/
+├── include/
+├── src/
+│   └── main.cpp
+└── third_party/
+    └── tcpshm/             # 复制自本仓库 include/tcpshm/（或 Release 压缩包）
+        ├── detail/
+        ├── client.hpp
+        ├── server.hpp
+        └── tcpshm.hpp ...
+```
+
+**使用注意（3 条必看）**：
+1. **头文件搜索路径必须包含 `third_party`**（因为内部统一以 `#include "tcpshm/..."` 引入）：
+   * **CMake**：
+     ```cmake
+     find_package(Threads REQUIRED)
+     target_include_directories(your_app PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
+     target_compile_features(your_app PRIVATE cxx_std_20)
+     target_link_libraries(your_app PRIVATE
+       Threads::Threads
+       $<$<PLATFORM_ID:Linux>:rt>
+       $<$<PLATFORM_ID:Windows>:ws2_32>
+     )
+     ```
+   * **命令行直编**：
+     ```bash
+     g++ -std=c++20 -O3 -Iinclude -Ithird_party src/main.cpp -pthread -lrt -o your_app
+     ```
+2. **业务代码直接包含入口头 `#include "tcpshm/tcpshm.hpp"`**：切勿在未配置 `-Ithird_party` 时直接 `#include "third_party/tcpshm/tcpshm.hpp"`，否则内部头文件会找不到路径。
+3. **核心库零第三方依赖**：`include/tcpshm/` 仅依赖 C++20 标准库与系统运行库（Linux 需链接 `-pthread -lrt`；Windows 需 `ws2_32`，MSVC 下已通过 `#pragma comment(lib, "ws2_32.lib")` 自动链接）。仓库内的 `third_party/iguana` 与 `third_party/frozen` 仅用于 `examples/` 示例，集成核心库时无需拷贝。
 
 ## 文档与示例
 
@@ -58,13 +142,12 @@ target_link_libraries(my_app PRIVATE tcpshm::tcpshm)
 
 ## 测试矩阵
 
-CTest 自动运行 4 套单元测试/集成测试、`-fno-exceptions` 编译门禁及 Benchmark 冒烟：
+CTest 自动运行 4 套单元与集成测试（`-fno-exceptions -Werror` 严格编译门禁与 Benchmark 冒烟在 GitHub Actions CI 中持续验证）：
 
 * [`tests/unit_spsc_test.cpp`](tests/unit_spsc_test.cpp)：`kMaxPayloadSize` 边界、`alignas(16)` 零拷贝 `emplace`/`as_ptr`、>64 KiB（`128 KiB`）大包收发、RAII Guard 自动取消/消费、回绕安全、多 `BlkSz`（16/32/64）、批量 `stage()+flush()`、`drain()` 背压与多线程压测。
 * [`tests/unit_ptcp_test.cpp`](tests/unit_ptcp_test.cpp)：持久化重启恢复（含 `128 KiB` 大包）、`uint32_t` 序列号回绕、损坏文件与容量/`header_size` 不匹配识别。
 * [`tests/integration_handshake_test.cpp`](tests/integration_handshake_test.cpp)：慢连接/卡死 SHM 探针 **0ms 非阻塞** 隔离、配置不匹配/非法名/重复登录/超限拒收、`ConnHandle` ABA 防护。
 * [`tests/integration_server_client_test.cpp`](tests/integration_server_client_test.cpp)：SHM、`BusyPoller` TCP 与 Linux `EpollPoller` TCP 端到端全链路，含 >64 KiB（`128 KiB + 13B`）连发 3 轮验证即时 ACK 捎带、`flags`/`reserved` 透传、背压、重连续传与序列号错配。
-* [`tests/noexcept_compile_check.cpp`](tests/noexcept_compile_check.cpp)：持续确保全部核心头文件可在 `-fno-exceptions -Werror` 下无错编译。
 
 ## 三版本同机绑核性能对比 (`v1.0.0` vs `v2-8B/C++23` vs `v2-16B/C++20`)
 
@@ -75,11 +158,11 @@ CTest 自动运行 4 套单元测试/集成测试、`-fno-exceptions` 编译门�
 * `--pin-recv=<core>`：将 SHM 流水线吞吐测试中的独立接收线程 `recv_thr` 绑定到指定 CPU 核心。
 
 ```bash
-./build/tcpshm_bench --mode=spsc       --iters=3000000 --warmup=100000 --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2
-./build/tcpshm_bench --mode=rtt        --iters=50000   --warmup=5000   --sizes=16,64,256       --pin-server=0 --pin-client=2
-./build/tcpshm_bench --mode=throughput --iters=400000  --warmup=30000  --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2 --pin-recv=4
+./build/benchmarks/tcpshm_bench --mode=spsc       --iters=3000000 --warmup=100000 --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2
+./build/benchmarks/tcpshm_bench --mode=rtt        --iters=50000   --warmup=5000   --sizes=16,64,256       --pin-server=0 --pin-client=2
+./build/benchmarks/tcpshm_bench --mode=throughput --iters=400000  --warmup=30000  --sizes=16,48,56,64,256 --pin-server=0 --pin-client=2 --pin-recv=4
 # >64 KiB 大包延迟测试示例（未绑核）：
-./build/tcpshm_bench --mode=rtt        --iters=2000    --warmup=200    --sizes=131072
+./build/benchmarks/tcpshm_bench --mode=rtt        --iters=2000    --warmup=200    --sizes=131072
 ```
 
 ### 同条件绑核三版本对比 (`16B / 64B / 256B`)
